@@ -1,0 +1,8 @@
+# SHA-VERSE Bookshelf
+
+> SHA-VERSE Bookshelf is an EPUB and PDF ebook discovery and reading platform with author channels, bookmarks, highlights, ratings, and authentication.
+
+## Pages
+
+- [Bookshelf](/): Main ebook discovery and reading library (sign-in required).
+- [Sign in](/auth): Create an account or log in with email or Google.

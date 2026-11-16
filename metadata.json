@@ -1,0 +1,6 @@
+{
+  "name": "SHA-VERSE: The Next Generation",
+  "description": "Experience the future of social networking with AI-powered conversations, immersive videos, digital books, and vibrant communities—all in one ecosystem.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
