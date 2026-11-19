@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { useBookFeed, useTrendingBooks } from "./useBookFeeds";
 import { generateFileHash, checkBookDuplicate } from "@/modules/bookshelf/lib/fileHash";
 import { BOOK_PUBLIC_COLUMNS } from "@/lib/constants/bookshelf";
+import { isSchemaMissingError, SCHEMA_SETUP_HINT } from "@/integrations/supabase/config";
 
 export interface Book {
   id: string;
@@ -70,6 +71,8 @@ export const useBooks = (options: {
       isbn,
       publisher,
       publicationDate,
+      silent,
+      precomputedFileHash,
     }: {
       title: string;
       subtitle?: string;
@@ -89,23 +92,27 @@ export const useBooks = (options: {
       isbn?: string;
       publisher?: string;
       publicationDate?: string;
+      silent?: boolean;
+      precomputedFileHash?: string;
     }) => {
       if (!user?.id) throw new Error("Not authenticated");
 
       let coverUrl = null;
       let bookUrl = null;
-      let fileHash: string | null = null;
+      let fileHash: string | null = precomputedFileHash || null;
 
       // PHASE 1: Pre-flight anti-duplication check (file fingerprint + metadata)
       if (bookFile) {
-        toast.loading("Scanning for duplicates...", { id: "dup-check" });
-        fileHash = await generateFileHash(bookFile);
+        if (!silent) toast.loading("Scanning for duplicates...", { id: "dup-check" });
+        if (!fileHash) {
+          fileHash = await generateFileHash(bookFile);
+        }
         const dup = await checkBookDuplicate({
           fileHash,
           title,
           author,
         });
-        toast.dismiss("dup-check");
+        if (!silent) toast.dismiss("dup-check");
         if (dup.isDuplicate) {
           const reason =
             dup.matchType === "file"
@@ -113,7 +120,7 @@ export const useBooks = (options: {
               : `A book with this title and author already exists ("${dup.existingBook?.title}" by ${dup.existingBook?.author}).`;
           throw new Error(reason);
         }
-        toast.success("File verified — no duplicates found", { duration: 1500 });
+        if (!silent) toast.success("File verified — no duplicates found", { duration: 1500 });
       } else {
         // No file: still check metadata-level duplicates
         const dup = await checkBookDuplicate({ title, author });
@@ -127,8 +134,9 @@ export const useBooks = (options: {
       // Upload cover image to books bucket (compressed)
       if (coverFile) {
         const cover = await compressImage(coverFile);
-        const coverExt = cover.name.split(".").pop();
-        const coverName = `${user.id}/covers/${Date.now()}.${coverExt}`;
+        const coverExt = cover.name.split(".").pop() || "jpg";
+        const uniqueSuffix = Math.random().toString(36).slice(2, 8);
+        const coverName = `${user.id}/covers/${Date.now()}_${uniqueSuffix}.${coverExt}`;
 
         const { error: coverError } = await supabase.storage
           .from("books")
@@ -147,8 +155,9 @@ export const useBooks = (options: {
 
       // Upload book file to books bucket
       if (bookFile) {
-        const bookExt = bookFile.name.split(".").pop();
-        const bookName = `${user.id}/files/${Date.now()}.${bookExt}`;
+        const bookExt = bookFile.name.split(".").pop() || "pdf";
+        const uniqueSuffix = Math.random().toString(36).slice(2, 8);
+        const bookName = `${user.id}/files/${Date.now()}_${uniqueSuffix}.${bookExt}`;
 
         const { error: bookError } = await supabase.storage
           .from("books")
@@ -193,14 +202,22 @@ export const useBooks = (options: {
       if (error) throw error;
       return data;
     },
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       // Invalidate both main feed and channel specific lists
       queryClient.invalidateQueries({ queryKey: ["books", "feed"] });
       queryClient.invalidateQueries({ queryKey: ["books", "subscribed"] });
-      toast.success("Book uploaded successfully!");
+      if (!variables?.silent) {
+        toast.success("Book uploaded successfully!");
+      }
     },
-    onError: (error) => {
+    onError: (error, variables) => {
       console.error('Book upload failed:', error);
+      if (variables?.silent) return;
+
+      if (isSchemaMissingError(error)) {
+        toast.error(SCHEMA_SETUP_HINT);
+        return;
+      }
 
       // Handle specific error types
       const msg = error.message || '';

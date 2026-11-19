@@ -358,19 +358,14 @@ const Bookshelf = () => {
                 <>
 
                   <Button
-
                     onClick={() => setShowUploadDialog(true)}
-
                     size="icon"
-
                     variant="ghost"
-
+                    aria-label="Upload Book"
+                    title="Upload Book"
                     className="rounded-full w-9 h-9 text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
-
                   >
-
                     <Plus className="w-5 h-5" />
-
                   </Button>
 
 
