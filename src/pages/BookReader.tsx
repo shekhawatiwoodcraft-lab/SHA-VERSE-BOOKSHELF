@@ -1,12 +1,13 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 import { useBookInteractions } from "@/hooks/useBookInteractions";
 import { useReaderBookmarks } from "@/hooks/useReaderBookmarks";
 import { recordBookView, recordReadingSessionHeartbeat } from "@/lib/analytics/tracking";
 import PDFViewer, { PDFOutlineItem } from "@/components/bookshelf/PDFViewer";
-import EPUBViewer, { TocItem } from "@/components/bookshelf/EPUBViewer";
+import EPUBViewer, { TocItem, type EpubInlineTranslationResult } from "@/components/bookshelf/EPUBViewer";
 import PaginatedReader, { type PaginationInfo } from "@/components/bookshelf/reader/PaginatedReader";
 import ReaderSettingsPanel from "@/components/bookshelf/reader/ReaderSettingsPanel";
 import ReaderSearchPanel from "@/components/bookshelf/reader/ReaderSearchPanel";
@@ -37,6 +38,7 @@ import {
   type TranslationReadingMode,
 } from "@/lib/ai/languages";
 import {
+  chunkBlocksByBudget,
   extractCandidateGlossaryTerms,
   getChapterBlockRange,
   hashTextContent,
@@ -67,14 +69,6 @@ import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
@@ -82,6 +76,7 @@ import { StickyBannerAd, BookReaderInlineAd, NativeAdSlot } from "@/components/a
 import { isNativeAdsSupported } from "@/lib/ads/native/bridge";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { BOOK_PUBLIC_COLUMNS } from "@/lib/constants/bookshelf";
+import { appNavController, useRegisterBackOverlay, useSmartBack } from "@/lib/navigation";
 
 const MOBILE_PANEL_BOTTOM_OFFSET = "calc(112px + env(safe-area-inset-bottom))";
 const MOBILE_PANEL_MAX_HEIGHT = "calc(70vh - env(safe-area-inset-bottom))";
@@ -104,6 +99,8 @@ const getFileType = (url: string | null): "pdf" | "epub" | "unknown" => {
 const BookReader = () => {
   const { bookId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const handleBack = useSmartBack(bookId ? `/bookshelf/book/${bookId}` : "/bookshelf");
   const queryClient = useQueryClient();
   const isMobile = useIsMobile();
   const epubRef = useRef<HTMLDivElement>(null);
@@ -139,7 +136,10 @@ const BookReader = () => {
         .select(BOOK_PUBLIC_COLUMNS)
         .eq("id", bookId)
         .single();
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return null;
+        throw error;
+      }
       return data;
     },
     enabled: !!bookId,
@@ -196,6 +196,10 @@ const BookReader = () => {
   const [epubExtracting, setEpubExtracting] = useState(false);
 
   const isReaderMode = fileType === "pdf" && viewMode === "reader";
+  const [pdfExtractionArmed, setPdfExtractionArmed] = useState(isReaderMode);
+  useEffect(() => {
+    if (isReaderMode || aiExtractionRequested) setPdfExtractionArmed(true);
+  }, [isReaderMode, aiExtractionRequested]);
   const observedDisplayPage = isReaderMode ? readerPagination.page : currentPage;
   const nativeReaderAdsEnabled = isNativeAdsSupported();
 
@@ -204,7 +208,7 @@ const BookReader = () => {
     url: book?.book_url ?? undefined,
     title: book?.title,
     author: book?.author,
-    enabled: (isReaderMode || aiExtractionRequested) && fileType === "pdf" && !!book?.book_url,
+    enabled: (isReaderMode || aiExtractionRequested || pdfExtractionArmed) && fileType === "pdf" && !!book?.book_url,
     ocr: true,
   });
 
@@ -218,8 +222,11 @@ const BookReader = () => {
     [activeReflowBook],
   );
 
-  // Unified Settings Sheet + Tabs
-  const [showSettingsSheet, setShowSettingsSheet] = useState(false);
+  // Unified Full-Screen Settings state synced cleanly with `?settings=1` history param
+  const showSettingsSheet = useMemo(
+    () => new URLSearchParams(location.search).get("settings") === "1",
+    [location.search],
+  );
   const [settingsTab, setSettingsTab] = useState<"appearance" | "translation" | "audio">(
     "appearance",
   );
@@ -244,8 +251,13 @@ const BookReader = () => {
   } | null>(null);
   const [translationError, setTranslationError] = useState<string | null>(null);
   const [translationErrorCode, setTranslationErrorCode] = useState<string | null>(null);
+  const [inlineTranslationVisible, setInlineTranslationVisible] = useState<Record<string, boolean>>({});
+  const [inlineTranslatingIds, setInlineTranslatingIds] = useState<Record<string, boolean>>({});
+  const [inlineTranslateErrors, setInlineTranslateErrors] = useState<Record<string, string>>({});
+  const activeTranslationKeyRef = useRef("");
   const translationAbortRef = useRef<AbortController | null>(null);
   const pendingAutoTranslateLangRef = useRef<string | null>(null);
+  const pendingAutoStartVoiceRef = useRef<GeminiPrebuiltVoiceId | null>(null);
 
   // Listening state (synced automatically when user chooses a Translation language)
   const [hasChosenTranslationLanguage, setHasChosenTranslationLanguage] = useState(false);
@@ -367,11 +379,17 @@ const BookReader = () => {
     return byPage;
   }, [activeChapters, currentPage]);
 
+  const hasTextBlocks = useCallback((b: ReflowBook | null | undefined) => {
+    return Boolean(b?.blocks.some((blk) => blk.type === "heading" || blk.type === "paragraph"));
+  }, []);
+
   // Ensure structured blocks exist (PDF reflow or EPUB spine extraction) when AI features are requested
   const ensureStructuredBook = useCallback(async (): Promise<ReflowBook | null> => {
     if (fileType === "pdf") {
       if (!aiExtractionRequested) setAiExtractionRequested(true);
-      if (reflow.book && reflow.book.blocks.length > 0) return reflow.book;
+      if (reflow.book && (hasTextBlocks(reflow.book) || reflow.status === "ready")) {
+        return reflow.book;
+      }
       return null;
     }
     if (fileType === "epub" && book?.book_url && bookId) {
@@ -391,7 +409,7 @@ const BookReader = () => {
       }
     }
     return null;
-  }, [fileType, aiExtractionRequested, reflow.book, book?.book_url, book?.title, book?.author, bookId, epubReflowBook]);
+  }, [fileType, aiExtractionRequested, reflow.book, reflow.status, hasTextBlocks, book?.book_url, book?.title, book?.author, bookId, epubReflowBook]);
 
   // Load saved detected language and cached translation for current (bookId, targetLanguage, quality)
   useEffect(() => {
@@ -410,15 +428,28 @@ const BookReader = () => {
   useEffect(() => {
     if (!bookId) return;
     let alive = true;
+    const key = `${bookId}:${targetLanguage}:${translationQuality}`;
+    const keyChanged = activeTranslationKeyRef.current !== key;
+    activeTranslationKeyRef.current = key;
+
+    if (keyChanged) {
+      setInlineTranslationVisible({});
+      setInlineTranslatingIds({});
+      setInlineTranslateErrors({});
+    }
+
     void loadCachedTranslation(bookId, targetLanguage, translationQuality).then((cached) => {
-      if (!alive) return;
+      if (!alive || activeTranslationKeyRef.current !== key) return;
       if (cached) {
-        setTranslatedMap(cached.translatedMap || {});
+        setTranslatedMap((prev) => ({
+          ...(cached.translatedMap || {}),
+          ...prev,
+        }));
         setCompletedChapterIds(cached.completedChapters || []);
         setFailedChapterIds(cached.failedChapters || []);
         setGlossary(cached.glossary || []);
         if (cached.detectedSourceLanguage) setSourceLanguage(cached.detectedSourceLanguage);
-      } else {
+      } else if (keyChanged) {
         setTranslatedMap({});
         setCompletedChapterIds([]);
         setFailedChapterIds([]);
@@ -514,25 +545,35 @@ const BookReader = () => {
               .slice(0, maxBlocksOverride);
           }
 
-          const BATCH_SIZE = 10;
-          const totalBatches = Math.max(1, Math.ceil(sampleBlocks.length / BATCH_SIZE));
-          let doneBatches = 0;
+          if (sampleBlocks.length === 0) {
+            setTranslationError("No translatable text paragraphs were found on these pages yet.");
+            setTranslationErrorCode("NO_TEXT_CONTENT");
+            return nextMap;
+          }
 
-          for (let i = 0; i < sampleBlocks.length; i += BATCH_SIZE) {
+          const sampleBatches = chunkBlocksByBudget(sampleBlocks, 4, 4_500);
+          const totalBatches = Math.max(1, sampleBatches.length);
+          let doneBatches = 0;
+          let sampleOffset = 0;
+
+          for (const batch of sampleBatches) {
             if (controller.signal.aborted) break;
-            const batch = sampleBlocks.slice(i, i + BATCH_SIZE);
             setTranslationProgress({
               done: doneBatches,
               total: totalBatches,
               label: `Translating (${getLanguageMeta(effectiveTargetLang).nativeName})...`,
             });
 
-            const prevCtx = structBook.blocks
-              .slice(Math.max(0, fromIdx + i - 2), fromIdx + i)
-              .filter((b): b is Extract<typeof b, { type: "paragraph" | "heading" }> =>
-                b.type === "paragraph" || b.type === "heading",
-              )
-              .map((b) => b.text);
+            const prevCtx =
+              sampleOffset > 0
+                ? sampleBlocks.slice(Math.max(0, sampleOffset - 2), sampleOffset).map((b) => b.text)
+                : structBook.blocks
+                    .slice(Math.max(0, fromIdx - 2), fromIdx)
+                    .filter((b): b is Extract<typeof b, { type: "paragraph" | "heading" }> =>
+                      b.type === "paragraph" || b.type === "heading",
+                    )
+                    .map((b) => b.text);
+            sampleOffset += batch.length;
 
             const resp = await translateBookBatch({
               bookTitle: book?.title,
@@ -612,13 +653,16 @@ const BookReader = () => {
 
           const chapterBlockMap: Record<string, string> = {};
           let chapterFailed = false;
-          const BATCH_SIZE = 10;
+          const chapterBatches = chunkBlocksByBudget(textBlocks, 10, 16_000);
+          let chapterOffset = 0;
 
-          for (let i = 0; i < textBlocks.length; i += BATCH_SIZE) {
+          for (const batch of chapterBatches) {
             if (controller.signal.aborted) break;
-            const batch = textBlocks.slice(i, i + BATCH_SIZE);
             try {
-              const prevCtx = textBlocks.slice(Math.max(0, i - 2), i).map((b) => b.text);
+              const prevCtx = textBlocks
+                .slice(Math.max(0, chapterOffset - 2), chapterOffset)
+                .map((b) => b.text);
+              chapterOffset += batch.length;
               const resp = await translateBookBatch({
                 bookTitle: book?.title,
                 sourceLanguage,
@@ -727,7 +771,9 @@ const BookReader = () => {
         }
         return nextMap;
       } finally {
-        setIsTranslating(false);
+        if (translationAbortRef.current === controller) {
+          setIsTranslating(false);
+        }
       }
     },
     [bookId, book?.title, sourceLanguage, targetLanguage, translationQuality, audiobook],
@@ -746,7 +792,7 @@ const BookReader = () => {
       completedChapterIds,
       failedChapterIds,
       glossary,
-      18,
+      4,
       currentLocationBlockRef.current.blockIndex,
     );
   }, [
@@ -843,6 +889,17 @@ const BookReader = () => {
     };
   }, [activeReflowBook, translationReadingMode, targetLanguage, translatedMap]);
 
+  const originalBlockTextMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    if (!activeReflowBook) return map;
+    for (const block of activeReflowBook.blocks) {
+      if (block.type === "heading" || block.type === "paragraph") {
+        map[block.id] = block.text;
+      }
+    }
+    return map;
+  }, [activeReflowBook]);
+
   const handleSelectAndTranslateLanguage = useCallback(
     async (newLangCode: string) => {
       setTargetLanguage(newLangCode);
@@ -896,7 +953,7 @@ const BookReader = () => {
         cachedCompleted,
         cachedFailed,
         cachedGlossary,
-        24,
+        4,
         currentLocationBlockRef.current.blockIndex,
         newLangCode,
       );
@@ -912,10 +969,10 @@ const BookReader = () => {
     ],
   );
 
-  // If user selected a language while PDF text extraction was still running, auto-translate as soon as blocks arrive
+  // If user selected a language while PDF text extraction was still running, auto-translate as soon as text blocks arrive
   useEffect(() => {
     const pendingLang = pendingAutoTranslateLangRef.current;
-    if (!pendingLang || !activeReflowBook || activeReflowBook.blocks.length === 0) return;
+    if (!pendingLang || !activeReflowBook || !hasTextBlocks(activeReflowBook)) return;
     pendingAutoTranslateLangRef.current = null;
     void runChapterTranslation(
       activeReflowBook,
@@ -924,11 +981,11 @@ const BookReader = () => {
       [],
       [],
       [],
-      24,
+      4,
       currentLocationBlockRef.current.blockIndex,
       pendingLang,
     );
-  }, [activeReflowBook, currentChapterIndex, runChapterTranslation]);
+  }, [activeReflowBook, currentChapterIndex, hasTextBlocks, runChapterTranslation]);
 
   const prepareAudioTabState = useCallback(async () => {
     if (!bookId || !book) return;
@@ -959,14 +1016,82 @@ const BookReader = () => {
   const handleSelectSettingsTab = useCallback(
     (tab: "appearance" | "translation" | "audio") => {
       setSettingsTab(tab);
-      if (tab === "translation") {
-        void ensureStructuredBook();
-      } else if (tab === "audio") {
-        void prepareAudioTabState();
+      if (fileType === "pdf" && !aiExtractionRequested) {
+        setAiExtractionRequested(true);
       }
     },
-    [ensureStructuredBook, prepareAudioTabState],
+    [fileType, aiExtractionRequested],
   );
+
+  const openSettingsOverlay = useCallback(() => {
+    setShowToc(false);
+    setShowBookmarks(false);
+    setShowSearch(false);
+    if (fileType === "pdf" && !aiExtractionRequested) {
+      setAiExtractionRequested(true);
+    }
+
+    const params = new URLSearchParams(location.search);
+    if (params.get("settings") !== "1") {
+      params.set("settings", "1");
+      const qs = params.toString();
+      navigate(`${location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [
+    location.pathname,
+    location.search,
+    navigate,
+    fileType,
+    aiExtractionRequested,
+  ]);
+
+  const closeSettingsOverlay = useCallback(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get("settings") !== "1") return;
+    if (appNavController.canGoBack()) {
+      navigate(-1);
+    } else {
+      params.delete("settings");
+      const qs = params.toString();
+      navigate(`${location.pathname}${qs ? `?${qs}` : ""}`, { replace: true });
+    }
+  }, [location.pathname, location.search, navigate]);
+
+  const closeTocOverlay = useCallback(() => setShowToc(false), []);
+  const closeBookmarksOverlay = useCallback(() => setShowBookmarks(false), []);
+  const closeSearchOverlay = useCallback(() => setShowSearch(false), []);
+  const cancelNoteOverlay = useCallback(() => {
+    setNoteDraft((curr) => {
+      if (curr) removeHighlight(curr.highlightId);
+      return null;
+    });
+  }, [removeHighlight]);
+
+  useRegisterBackOverlay(showToc, "reader-toc", closeTocOverlay);
+  useRegisterBackOverlay(showBookmarks, "reader-bookmarks", closeBookmarksOverlay);
+  useRegisterBackOverlay(showSearch, "reader-search", closeSearchOverlay);
+  useRegisterBackOverlay(showSettingsSheet, "reader-settings", closeSettingsOverlay);
+  useRegisterBackOverlay(Boolean(noteDraft), "reader-note-draft", cancelNoteOverlay);
+
+  useEffect(() => {
+    if (!showSettingsSheet || typeof document === "undefined") return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [showSettingsSheet]);
+
+  const ensureStructuredBookRef = useRef(ensureStructuredBook);
+  const prepareAudioTabStateRef = useRef(prepareAudioTabState);
+  ensureStructuredBookRef.current = ensureStructuredBook;
+  prepareAudioTabStateRef.current = prepareAudioTabState;
+
+  useEffect(() => {
+    if (!showSettingsSheet) return;
+    if (settingsTab === "translation") void ensureStructuredBookRef.current();
+    else if (settingsTab === "audio") void prepareAudioTabStateRef.current();
+  }, [showSettingsSheet, settingsTab, bookId]);
 
   const resolveAudioLanguageAndMap = useCallback(
     async (
@@ -974,7 +1099,7 @@ const BookReader = () => {
       startBlockIdx: number,
     ): Promise<{ audioLang: string; audioMap?: Record<string, string> }> => {
       const wantTranslated =
-        (listenInTranslated || hasChosenTranslationLanguage) && targetLanguage !== sourceLanguage;
+        listenInTranslated && targetLanguage !== sourceLanguage;
       if (!wantTranslated || !bookId) {
         return { audioLang: sourceLanguage, audioMap: undefined };
       }
@@ -1004,7 +1129,7 @@ const BookReader = () => {
             completedChapterIds,
             failedChapterIds,
             glossary,
-            24,
+            4,
             startBlockIdx,
             targetLanguage,
           );
@@ -1020,7 +1145,6 @@ const BookReader = () => {
     },
     [
       listenInTranslated,
-      hasChosenTranslationLanguage,
       targetLanguage,
       sourceLanguage,
       bookId,
@@ -1036,8 +1160,11 @@ const BookReader = () => {
 
   const handleStartAudioFromChoice = useCallback(
     async (mode: "resume" | "reading_pos" | "chapter" | "beginning") => {
+      audiobook.unlockAudio();
       if (!book || !bookId) return;
-      const structBook = (await ensureStructuredBook()) ?? activeReflowBook;
+      const structBook = activeReflowBook && activeReflowBook.blocks.length > 0
+        ? activeReflowBook
+        : await ensureStructuredBook();
       if (!structBook || structBook.blocks.length === 0) return;
 
       const startIdx =
@@ -1124,15 +1251,21 @@ const BookReader = () => {
   // Clicking any voice card in Audio Reader immediately applies that voice AND auto-starts book playback in the chosen language
   const handleSelectAndStartVoice = useCallback(
     async (voiceId: GeminiPrebuiltVoiceId) => {
+      audiobook.unlockAudio();
       if (!book || !bookId) return;
-      const structBook = (await ensureStructuredBook()) ?? activeReflowBook;
+      audiobook.updatePreferences({ preferredVoice: voiceId });
+      const structBook = activeReflowBook && activeReflowBook.blocks.length > 0
+        ? activeReflowBook
+        : await ensureStructuredBook();
       if (!structBook || structBook.blocks.length === 0) {
-        audiobook.updatePreferences({ preferredVoice: voiceId });
+        pendingAutoStartVoiceRef.current = voiceId;
+        if (fileType === "pdf") setAiExtractionRequested(true);
         return;
       }
 
+      pendingAutoStartVoiceRef.current = null;
       const desiredUseTranslated =
-        (listenInTranslated || hasChosenTranslationLanguage) && targetLanguage !== sourceLanguage;
+        listenInTranslated && targetLanguage !== sourceLanguage;
       const desiredLang = desiredUseTranslated ? targetLanguage : sourceLanguage;
 
       if (
@@ -1144,7 +1277,6 @@ const BookReader = () => {
         return;
       }
 
-      audiobook.updatePreferences({ preferredVoice: voiceId });
       const startIdx = currentLocationBlockRef.current.blockIndex || 0;
       const { audioLang, audioMap } = await resolveAudioLanguageAndMap(structBook, startIdx);
 
@@ -1163,11 +1295,11 @@ const BookReader = () => {
     [
       book,
       bookId,
+      fileType,
       ensureStructuredBook,
       activeReflowBook,
       audiobook,
       listenInTranslated,
-      hasChosenTranslationLanguage,
       targetLanguage,
       sourceLanguage,
       resolveAudioLanguageAndMap,
@@ -1175,10 +1307,21 @@ const BookReader = () => {
     ],
   );
 
+  // If user selected a voice while book extraction was still completing, auto-start narration immediately when ready
+  useEffect(() => {
+    const pendingVoice = pendingAutoStartVoiceRef.current;
+    if (!pendingVoice || !activeReflowBook || !hasTextBlocks(activeReflowBook)) return;
+    pendingAutoStartVoiceRef.current = null;
+    void handleSelectAndStartVoice(pendingVoice);
+  }, [activeReflowBook, hasTextBlocks, handleSelectAndStartVoice]);
+
   const handleSentencePlayRequest = useCallback(
     async (blockId: string, sentenceIndex: number, isTranslatedColumn?: boolean) => {
+      audiobook.unlockAudio();
       if (!book || !bookId) return;
-      const structBook = (await ensureStructuredBook()) ?? activeReflowBook;
+      const structBook = activeReflowBook && activeReflowBook.blocks.length > 0
+        ? activeReflowBook
+        : await ensureStructuredBook();
       if (!structBook) return;
 
       const wantTranslated =
@@ -1220,6 +1363,350 @@ const BookReader = () => {
       sourceLanguage,
       audiobook,
     ],
+  );
+
+  const handleCloseInlineTranslation = useCallback((blockId: string) => {
+    setInlineTranslationVisible((prev) => ({ ...prev, [blockId]: false }));
+    setInlineTranslateErrors((prev) => {
+      if (!prev[blockId]) return prev;
+      const next = { ...prev };
+      delete next[blockId];
+      return next;
+    });
+  }, []);
+
+  const handleParagraphTranslate = useCallback(
+    async (blockId: string) => {
+      if (!bookId) return;
+      const structBook =
+        activeReflowBook && activeReflowBook.blocks.length > 0
+          ? activeReflowBook
+          : await ensureStructuredBook();
+      if (!structBook) return;
+
+      const bIdx = structBook.blocks.findIndex((b) => b.id === blockId);
+      if (bIdx < 0) return;
+      const block = structBook.blocks[bIdx];
+      if (block.type !== "paragraph" && block.type !== "heading") return;
+
+      // Toggle off immediately if already visible
+      if (inlineTranslationVisible[blockId]) {
+        setInlineTranslationVisible((prev) => ({ ...prev, [blockId]: false }));
+        return;
+      }
+
+      // Resolve effective target language (avoid no-op same-language pair)
+      const effectiveTargetLang =
+        targetLanguage !== sourceLanguage
+          ? targetLanguage
+          : audiobook.preferences.preferredTargetLanguage &&
+              audiobook.preferences.preferredTargetLanguage !== sourceLanguage
+            ? audiobook.preferences.preferredTargetLanguage
+            : sourceLanguage === "en"
+              ? "hi"
+              : "en";
+
+      let workingMap = translatedMap;
+      if (effectiveTargetLang !== targetLanguage) {
+        activeTranslationKeyRef.current = `${bookId}:${effectiveTargetLang}:${translationQuality}`;
+        setTargetLanguage(effectiveTargetLang);
+        setHasChosenTranslationLanguage(true);
+        setListenInTranslated(true);
+        audiobook.updatePreferences({
+          preferredTargetLanguage: effectiveTargetLang,
+          preferredTtsLanguage: effectiveTargetLang,
+        });
+        const cached = await loadCachedTranslation(bookId, effectiveTargetLang, translationQuality);
+        workingMap = cached?.translatedMap || {};
+        setTranslatedMap(workingMap);
+        setCompletedChapterIds(cached?.completedChapters || []);
+        setFailedChapterIds(cached?.failedChapters || []);
+        setGlossary(cached?.glossary || []);
+      }
+
+      // Instantaneous toggle if already cached in memory
+      if (workingMap[blockId]) {
+        setInlineTranslateErrors((prev) => {
+          if (!prev[blockId]) return prev;
+          const next = { ...prev };
+          delete next[blockId];
+          return next;
+        });
+        setInlineTranslationVisible((prev) => ({ ...prev, [blockId]: true }));
+        return;
+      }
+
+      if (inlineTranslatingIds[blockId]) return;
+
+      setInlineTranslatingIds((prev) => ({ ...prev, [blockId]: true }));
+      setInlineTranslateErrors((prev) => {
+        if (!prev[blockId]) return prev;
+        const next = { ...prev };
+        delete next[blockId];
+        return next;
+      });
+
+      try {
+        const prevCtx = structBook.blocks
+          .slice(Math.max(0, bIdx - 1), bIdx)
+          .filter(
+            (b): b is Extract<typeof b, { type: "paragraph" | "heading" }> =>
+              b.type === "paragraph" || b.type === "heading",
+          )
+          .map((b) => b.text);
+
+        const resp = await translateBookBatch({
+          bookTitle: book?.title,
+          sourceLanguage,
+          targetLanguage: effectiveTargetLang,
+          quality: translationQuality,
+          blocks: [{ id: block.id, type: block.type, text: block.text }],
+          previousContext: prevCtx,
+          glossary: glossary.slice(0, 8),
+        });
+
+        const translatedText =
+          resp.items.find((item) => item.id === block.id)?.translatedText ||
+          resp.items[0]?.translatedText;
+
+        if (!translatedText) {
+          setInlineTranslateErrors((prev) => ({
+            ...prev,
+            [blockId]: "No translation was returned for this paragraph.",
+          }));
+          return;
+        }
+
+        let mergedMap: Record<string, string> = {};
+        setTranslatedMap((prev) => {
+          mergedMap = { ...prev, ...workingMap, [blockId]: translatedText };
+          return mergedMap;
+        });
+        if (Object.keys(mergedMap).length === 0) {
+          mergedMap = { ...workingMap, [blockId]: translatedText };
+        }
+
+        // Only expand the inline card when the global mode is not already displaying translated text
+        if (translationReadingMode !== "translated") {
+          setInlineTranslationVisible((prev) => ({ ...prev, [blockId]: true }));
+        }
+
+        void saveCachedTranslation({
+          bookId,
+          sourceLanguage,
+          targetLanguage: effectiveTargetLang,
+          quality: translationQuality,
+          translatedMap: mergedMap,
+          completedChapters: completedChapterIds,
+          failedChapters: failedChapterIds,
+          glossary,
+          detectedSourceLanguage: sourceLanguage,
+          updatedAt: Date.now(),
+        });
+        audiobook.updateSessionTranslationMap(bookId, effectiveTargetLang, mergedMap);
+      } catch (err) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : "Could not translate this paragraph right now.";
+        setInlineTranslateErrors((prev) => ({ ...prev, [blockId]: msg }));
+      } finally {
+        setInlineTranslatingIds((prev) => {
+          if (!prev[blockId]) return prev;
+          const next = { ...prev };
+          delete next[blockId];
+          return next;
+        });
+      }
+    },
+    [
+      bookId,
+      book?.title,
+      activeReflowBook,
+      ensureStructuredBook,
+      inlineTranslationVisible,
+      inlineTranslatingIds,
+      targetLanguage,
+      sourceLanguage,
+      audiobook,
+      translationQuality,
+      translatedMap,
+      glossary,
+      completedChapterIds,
+      failedChapterIds,
+      translationReadingMode,
+    ],
+  );
+
+  const handleParagraphAudio = useCallback(
+    async (blockId: string, forceTranslated?: boolean) => {
+      // Unlock HTMLAudioElement synchronously inside the user tap gesture
+      audiobook.unlockAudio();
+      if (!book || !bookId) return;
+
+      if (
+        audiobook.session?.bookId === bookId &&
+        audiobook.activeSegment?.blockId === blockId
+      ) {
+        if (audiobook.status === "playing") {
+          audiobook.pausePlayback();
+          return;
+        }
+        if (audiobook.status === "paused") {
+          audiobook.resumePlayback();
+          return;
+        }
+        if (audiobook.status === "loading") {
+          return;
+        }
+      }
+
+      const structBook =
+        activeReflowBook && activeReflowBook.blocks.length > 0
+          ? activeReflowBook
+          : await ensureStructuredBook();
+      if (!structBook) return;
+
+      const useTranslated =
+        typeof forceTranslated === "boolean"
+          ? forceTranslated && Boolean(translatedMap[blockId])
+          : Boolean(
+              (inlineTranslationVisible[blockId] || translationReadingMode === "translated") &&
+                translatedMap[blockId],
+            );
+
+      const lang = useTranslated ? targetLanguage : sourceLanguage;
+      const mapToUse = useTranslated ? translatedMap : undefined;
+      setListenInTranslated(useTranslated);
+
+      const canReuseSession =
+        audiobook.session?.bookId === bookId &&
+        audiobook.session.language === lang &&
+        audiobook.status !== "idle" &&
+        (!useTranslated || audiobook.session.translatedMap?.[blockId] === translatedMap[blockId]);
+
+      if (canReuseSession) {
+        await audiobook.jumpToBlockSentence(blockId, 0);
+      } else {
+        await audiobook.startBookPlayback({
+          bookId,
+          bookTitle: book.title,
+          author: book.author ?? undefined,
+          coverUrl: book.cover_url,
+          reflowBook: structBook,
+          language: lang,
+          translatedMap: mapToUse,
+          startBlockId: blockId,
+          startSentenceIndex: 0,
+        });
+      }
+    },
+    [
+      audiobook,
+      book,
+      bookId,
+      activeReflowBook,
+      ensureStructuredBook,
+      translatedMap,
+      inlineTranslationVisible,
+      translationReadingMode,
+      targetLanguage,
+      sourceLanguage,
+    ],
+  );
+
+  const epubInlineTrCacheRef = useRef<Map<string, EpubInlineTranslationResult>>(new Map());
+
+  const handleEpubParagraphTranslate = useCallback(
+    async (paragraphText: string): Promise<EpubInlineTranslationResult> => {
+      const normalized = paragraphText.replace(/\s+/g, " ").trim();
+      const effectiveTargetLang =
+        targetLanguage !== sourceLanguage
+          ? targetLanguage
+          : audiobook.preferences.preferredTargetLanguage &&
+              audiobook.preferences.preferredTargetLanguage !== sourceLanguage
+            ? audiobook.preferences.preferredTargetLanguage
+            : sourceLanguage === "en"
+              ? "hi"
+              : "en";
+
+      if (effectiveTargetLang !== targetLanguage) {
+        setTargetLanguage(effectiveTargetLang);
+        setHasChosenTranslationLanguage(true);
+        setListenInTranslated(true);
+        audiobook.updatePreferences({
+          preferredTargetLanguage: effectiveTargetLang,
+          preferredTtsLanguage: effectiveTargetLang,
+        });
+      }
+
+      const tgtMeta = getLanguageMeta(effectiveTargetLang);
+      const cacheKey = `${bookId || "book"}:${effectiveTargetLang}:${normalized}`;
+      const cached = epubInlineTrCacheRef.current.get(cacheKey);
+      if (cached) return cached;
+
+      const resp = await translateBookBatch({
+        bookTitle: book?.title,
+        sourceLanguage,
+        targetLanguage: effectiveTargetLang,
+        quality: translationQuality,
+        blocks: [{ id: "epub-inline-0", type: "paragraph", text: normalized }],
+        glossary: glossary.slice(0, 8),
+      });
+
+      const translatedText =
+        resp.items[0]?.translatedText || "No translation returned for this paragraph.";
+      const result: EpubInlineTranslationResult = {
+        translatedText,
+        languageName: tgtMeta.name,
+        nativeName: tgtMeta.nativeName,
+        dir: tgtMeta.dir,
+      };
+      epubInlineTrCacheRef.current.set(cacheKey, result);
+      return result;
+    },
+    [
+      bookId,
+      book?.title,
+      targetLanguage,
+      sourceLanguage,
+      translationQuality,
+      glossary,
+      audiobook,
+    ],
+  );
+
+  const handleEpubParagraphAudio = useCallback(
+    async (paragraphText: string) => {
+      audiobook.unlockAudio();
+      if (!book || !bookId) return;
+      const structBook =
+        activeReflowBook && activeReflowBook.blocks.length > 0
+          ? activeReflowBook
+          : await ensureStructuredBook();
+      if (!structBook) return;
+
+      const normTarget = paragraphText.replace(/\s+/g, " ").trim().toLowerCase();
+      const snippet = normTarget.slice(0, 60);
+      const matched =
+        structBook.blocks.find(
+          (b) =>
+            (b.type === "paragraph" || b.type === "heading") &&
+            b.text.replace(/\s+/g, " ").trim().toLowerCase() === normTarget,
+        ) ||
+        structBook.blocks.find(
+          (b) =>
+            (b.type === "paragraph" || b.type === "heading") &&
+            snippet.length > 8 &&
+            b.text.replace(/\s+/g, " ").trim().toLowerCase().includes(snippet),
+        ) ||
+        structBook.blocks.find((b) => b.type === "paragraph" || b.type === "heading");
+
+      if (matched) {
+        await handleParagraphAudio(matched.id);
+      }
+    },
+    [audiobook, book, bookId, activeReflowBook, ensureStructuredBook, handleParagraphAudio],
   );
 
   const handleCreateHighlight = useCallback(
@@ -1454,9 +1941,21 @@ const BookReader = () => {
     [getEpubMethods],
   );
 
-  // Keyboard navigation (desktop): ArrowLeft/Right to flip, Escape to toggle controls
+  // Keyboard navigation (desktop): ArrowLeft/Right to flip, Escape closes top overlay or toggles controls
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (appNavController.popOverlay()) {
+          e.preventDefault();
+          return;
+        }
+        e.preventDefault();
+        setShowControls((prev) => !prev);
+        return;
+      }
+
+      if (showSettingsSheet) return;
+
       const target = e.target as HTMLElement | null;
       const tag = target?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) return;
@@ -1473,14 +1972,11 @@ const BookReader = () => {
         else if (fileType === "epub") epubNext();
         else setCurrentPage((p) => (totalPages > 0 ? Math.min(totalPages, p + 1) : p + 1));
         setShowControls(true);
-      } else if (e.key === "Escape") {
-        e.preventDefault();
-        setShowControls((prev) => !prev);
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [fileType, totalPages, isReaderMode, requestFlip, epubNext, epubPrev]);
+  }, [fileType, totalPages, isReaderMode, showSettingsSheet, requestFlip, epubNext, epubPrev]);
 
   const handleBookmarkToggle = () => {
     if (isPageBookmarked(currentPage)) {
@@ -1588,7 +2084,7 @@ const BookReader = () => {
               variant="ghost"
               size="icon"
               aria-label="Back"
-              onClick={() => navigate(-1)}
+              onClick={() => handleBack()}
             >
               <ArrowLeft className="w-5 h-5" />
             </Button>
@@ -1700,300 +2196,337 @@ const BookReader = () => {
               </DropdownMenuContent>
             </DropdownMenu>
 
-            {/* Unified Settings Sheet (Appearance + Flow/PDF at bottom + Translation + Audio) */}
-            <Sheet
-              open={showSettingsSheet}
-              onOpenChange={(open) => {
-                setShowSettingsSheet(open);
-                if (open) {
-                  if (settingsTab === "translation") void ensureStructuredBook();
-                  else if (settingsTab === "audio") void prepareAudioTabState();
-                }
-              }}
+            {/* Full-Screen Settings Screen Trigger */}
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Reading settings"
+              aria-expanded={showSettingsSheet}
+              onClick={openSettingsOverlay}
             >
-              <SheetTrigger asChild>
-                <Button variant="ghost" size="icon" aria-label="Reading settings">
-                  <Settings className="w-5 h-5" />
-                </Button>
-              </SheetTrigger>
-              <SheetContent
-                side={isMobile ? "bottom" : "right"}
-                className={cn(
-                  "overflow-y-auto z-[65]",
-                  isMobile &&
-                    "rounded-t-2xl border-t border-x-0 border-b-0 p-4 max-h-[82vh]"
-                )}
-                style={
-                  isMobile
-                    ? {
-                        bottom: MOBILE_PANEL_BOTTOM_OFFSET,
-                        top: "auto",
-                        maxHeight: MOBILE_PANEL_MAX_HEIGHT,
-                      }
-                    : undefined
-                }
+              <Settings className="w-5 h-5" />
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      {/* Full-Screen Responsive Book Settings Overlay (Desktop / Tablet / Mobile) */}
+      {showSettingsSheet && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Reading Settings"
+          data-testid="book-settings-screen"
+          onClick={(e) => e.stopPropagation()}
+          className={cn(
+            "fixed inset-0 z-[70] w-screen h-[100dvh] flex flex-col overflow-hidden bg-background text-foreground",
+            isDarkReaderTheme(readerSettings.theme) && "dark",
+          )}
+        >
+          {/* Sticky Header with explicit Back & Close returning cleanly to the open book */}
+          <div
+            className="shrink-0 border-b border-border bg-background/95 backdrop-blur-sm"
+            style={{ paddingTop: "env(safe-area-inset-top, 0px)" }}
+          >
+            <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-2 px-3 sm:px-6">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={closeSettingsOverlay}
+                aria-label="Back to book"
+                className="gap-1.5 px-2.5 text-sm font-medium shrink-0"
               >
-                <SheetHeader>
-                  <SheetTitle>Reading Settings</SheetTitle>
-                  <SheetDescription className="sr-only">
-                    Customize reading appearance, AI translation, AI audiobook playback, and reader flow mode.
-                  </SheetDescription>
-                </SheetHeader>
+                <ArrowLeft className="h-4 w-4" />
+                <span>Back</span>
+              </Button>
 
-                {/* Text-only settings tabs (zero icons) */}
-                <div
-                  role="tablist"
-                  aria-label="Reader settings sections"
-                  className="mt-3 grid grid-cols-3 gap-1 rounded-lg bg-muted p-1"
-                >
-                  {(
-                    [
-                      { id: "appearance", label: "Appearance" },
-                      { id: "translation", label: "Translation" },
-                      { id: "audio", label: "Audio Reader" },
-                    ] as const
-                  ).map((tab) => {
-                    const active = settingsTab === tab.id;
-                    return (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        onClick={() => handleSelectSettingsTab(tab.id)}
-                        className={cn(
-                          "rounded-md px-2 py-1.5 text-xs font-medium transition-colors text-center",
-                          active
-                            ? "bg-background text-foreground shadow-sm font-semibold"
-                            : "text-muted-foreground hover:text-foreground",
-                        )}
-                      >
-                        {tab.label}
-                      </button>
-                    );
-                  })}
-                </div>
+              <div className="min-w-0 flex-1 text-center">
+                <h2 className="text-sm sm:text-base font-semibold leading-tight truncate">
+                  Reading Settings
+                </h2>
+                <p className="text-[11px] text-muted-foreground truncate">
+                  {book.title}
+                </p>
+              </div>
 
-                {settingsTab === "appearance" && (
-                  <>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={closeSettingsOverlay}
+                aria-label="Close reading settings"
+                className="gap-1.5 px-2.5 text-sm font-medium shrink-0"
+              >
+                <span>Close</span>
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+
+            {/* Text-only settings tabs (zero icons) */}
+            <div className="mx-auto max-w-5xl px-3 sm:px-6 pb-3">
+              <div
+                role="tablist"
+                aria-label="Reader settings sections"
+                className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1 max-w-xl mx-auto"
+              >
+                {(
+                  [
+                    { id: "appearance", label: "Appearance" },
+                    { id: "translation", label: "Translation" },
+                    { id: "audio", label: "Audio Reader" },
+                  ] as const
+                ).map((tab) => {
+                  const active = settingsTab === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => handleSelectSettingsTab(tab.id)}
+                      className={cn(
+                        "rounded-md px-3 py-2 text-xs sm:text-sm font-medium transition-colors text-center",
+                        active
+                          ? "bg-background text-foreground shadow-sm font-semibold"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {tab.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Scrollable Responsive Settings Workspace */}
+          <div
+            className="flex-1 min-h-0 overflow-y-auto overscroll-contain"
+            style={{ paddingBottom: "max(28px, env(safe-area-inset-bottom, 0px))" }}
+          >
+            <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 py-5 sm:py-6">
+              {settingsTab === "appearance" && (
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                  <div className="lg:col-span-7 rounded-xl border border-border/70 bg-card px-4 sm:px-5">
                     <ReaderSettingsPanel
                       settings={readerSettings}
                       onChange={updateReaderSetting}
                       onReset={resetReaderSettings}
                       engineMode={isReaderMode ? "reflow" : fileType === "epub" ? "epub" : "pdf-original"}
                     />
+                  </div>
 
-                    <div className="space-y-5 pb-6">
-                      {/* Zoom & Fit Mode (Original PDF mode only) */}
-                      {fileType === "pdf" && !isReaderMode && (
-                        <>
-                          <Separator />
-                          <div>
-                            <label className="text-sm font-medium mb-2.5 block">Page fit</label>
-                            <div className="grid grid-cols-2 gap-2">
-                              <Button
-                                variant={pdfFitMode === "page" ? "default" : "outline"}
-                                size="sm"
-                                onClick={() => { setPdfFitMode("page"); setScale(1); }}
-                              >
-                                Fit Page
-                              </Button>
-                              <Button
-                                variant={pdfFitMode === "width" ? "default" : "outline"}
-                                size="sm"
-                                onClick={() => { setPdfFitMode("width"); setScale(1); }}
-                              >
-                                Fit Width
-                              </Button>
-                            </div>
+                  <div className="lg:col-span-5 rounded-xl border border-border/70 bg-card p-4 sm:p-5 space-y-5">
+                    {/* Zoom & Fit Mode (Original PDF mode only) */}
+                    {fileType === "pdf" && !isReaderMode && (
+                      <>
+                        <div>
+                          <label className="text-sm font-medium mb-2.5 block">Page fit</label>
+                          <div className="grid grid-cols-2 gap-2">
+                            <Button
+                              variant={pdfFitMode === "page" ? "default" : "outline"}
+                              size="sm"
+                              onClick={() => { setPdfFitMode("page"); setScale(1); }}
+                            >
+                              Fit Page
+                            </Button>
+                            <Button
+                              variant={pdfFitMode === "width" ? "default" : "outline"}
+                              size="sm"
+                              onClick={() => { setPdfFitMode("width"); setScale(1); }}
+                            >
+                              Fit Width
+                            </Button>
                           </div>
-                          <div>
-                            <label className="text-sm font-medium mb-3 block">Zoom: {Math.round(scale * 100)}%</label>
-                            <div className="flex items-center gap-3">
-                              <span className="text-sm font-semibold opacity-75">−</span>
-                              <Slider
-                                value={[scale * 100]}
-                                onValueChange={(v) => setScale(v[0] / 100)}
-                                min={100}
-                                max={300}
-                                step={25}
-                              />
-                              <span className="text-sm font-semibold opacity-75">+</span>
-                            </div>
+                        </div>
+                        <div>
+                          <label className="text-sm font-medium mb-3 block">Zoom: {Math.round(scale * 100)}%</label>
+                          <div className="flex items-center gap-3">
+                            <span className="text-sm font-semibold opacity-75">−</span>
+                            <Slider
+                              value={[scale * 100]}
+                              onValueChange={(v) => setScale(v[0] / 100)}
+                              min={100}
+                              max={300}
+                              step={25}
+                            />
+                            <span className="text-sm font-semibold opacity-75">+</span>
                           </div>
-                        </>
-                      )}
-
-                      <Separator />
-
-                      {/* Go to Page */}
-                      <div>
-                        <label className="text-sm font-medium mb-3 block">Go to source page</label>
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="number"
-                            aria-label="Go to source page"
-                            value={currentPage}
-                            onChange={(e) => {
-                              const page = parseInt(e.target.value) || 1;
-                              goToPage(page);
-                            }}
-                            min={1}
-                            max={Math.max(totalPages, 1)}
-                            className="w-20 px-3 py-2 border rounded-md text-center bg-background"
-                          />
-                          <span className="text-muted-foreground text-sm">of {Math.max(totalPages, 1)}</span>
                         </div>
+                        <Separator />
+                      </>
+                    )}
+
+                    {/* Go to Page */}
+                    <div>
+                      <label className="text-sm font-medium mb-3 block">Go to source page</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="number"
+                          aria-label="Go to source page"
+                          value={currentPage}
+                          onChange={(e) => {
+                            const page = parseInt(e.target.value) || 1;
+                            goToPage(page);
+                          }}
+                          min={1}
+                          max={Math.max(totalPages, 1)}
+                          className="w-24 px-3 py-2 border rounded-md text-center bg-background"
+                        />
+                        <span className="text-muted-foreground text-sm">of {Math.max(totalPages, 1)}</span>
                       </div>
+                    </div>
 
-                      {/* Reading Progress */}
-                      <div>
-                        <label className="text-sm font-medium mb-2 block">Overall progress</label>
-                        <div className="w-full bg-muted rounded-full h-2.5">
-                          <div
-                            className="bg-primary h-2.5 rounded-full transition-all"
-                            style={{ width: `${displayPercent}%` }}
-                          />
-                        </div>
-                        <p className="text-xs text-muted-foreground mt-1">{displayPercent}% complete</p>
+                    {/* Reading Progress */}
+                    <div>
+                      <label className="text-sm font-medium mb-2 block">Overall progress</label>
+                      <div className="w-full bg-muted rounded-full h-2.5">
+                        <div
+                          className="bg-primary h-2.5 rounded-full transition-all"
+                          style={{ width: `${displayPercent}%` }}
+                        />
                       </div>
+                      <p className="text-xs text-muted-foreground mt-1">{displayPercent}% complete</p>
+                    </div>
 
-                      {/* Display Mode (Flow / Original) & More Tools (Translation / Audio Reader) — zero icons */}
-                      {(fileType === "pdf" || fileType === "epub") && (
-                        <>
-                          <Separator />
-                          <div className="space-y-3">
-                            <div>
-                              <p className="text-xs font-medium uppercase tracking-wider opacity-70 mb-2">
-                                Display mode
-                              </p>
-                              {fileType === "pdf" ? (
-                                <div className="grid grid-cols-2 gap-2">
-                                  <Button
-                                    type="button"
-                                    variant={isReaderMode ? "default" : "outline"}
-                                    size="sm"
-                                    aria-label="Switch to Flow display mode"
-                                    aria-pressed={isReaderMode}
-                                    onClick={() => setViewMode("reader")}
-                                    className="h-9 text-xs font-medium"
-                                  >
-                                    Flow
-                                  </Button>
-                                  <Button
-                                    type="button"
-                                    variant={!isReaderMode ? "default" : "outline"}
-                                    size="sm"
-                                    aria-label="Switch to Original PDF display mode"
-                                    aria-pressed={!isReaderMode}
-                                    onClick={() => {
-                                      setTranslationReadingMode("original");
-                                      setViewMode("original");
-                                    }}
-                                    className="h-9 text-xs font-medium"
-                                  >
-                                    Original
-                                  </Button>
-                                </div>
-                              ) : (
-                                <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                                  Flow (EPUB Adaptive Reading active)
-                                </div>
-                              )}
-                            </div>
-
-                            <div>
-                              <p className="text-xs font-medium uppercase tracking-wider opacity-70 mb-2">
-                                More tools
-                              </p>
+                    {/* Display Mode (Flow / Original) & More Tools (Translation / Audio Reader) — zero icons */}
+                    {(fileType === "pdf" || fileType === "epub") && (
+                      <>
+                        <Separator />
+                        <div className="space-y-4">
+                          <div>
+                            <p className="text-xs font-medium uppercase tracking-wider opacity-70 mb-2">
+                              Display mode
+                            </p>
+                            {fileType === "pdf" ? (
                               <div className="grid grid-cols-2 gap-2">
                                 <Button
                                   type="button"
-                                  variant="outline"
+                                  variant={isReaderMode ? "default" : "outline"}
                                   size="sm"
-                                  onClick={() => handleSelectSettingsTab("translation")}
+                                  aria-label="Switch to Flow display mode"
+                                  aria-pressed={isReaderMode}
+                                  onClick={() => setViewMode("reader")}
                                   className="h-9 text-xs font-medium"
                                 >
-                                  Translation
+                                  Flow
                                 </Button>
                                 <Button
                                   type="button"
-                                  variant="outline"
+                                  variant={!isReaderMode ? "default" : "outline"}
                                   size="sm"
-                                  onClick={() => handleSelectSettingsTab("audio")}
+                                  aria-label="Switch to Original PDF display mode"
+                                  aria-pressed={!isReaderMode}
+                                  onClick={() => {
+                                    setTranslationReadingMode("original");
+                                    setViewMode("original");
+                                  }}
                                   className="h-9 text-xs font-medium"
                                 >
-                                  Audio Reader
+                                  Original
                                 </Button>
                               </div>
+                            ) : (
+                              <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                                Flow (EPUB Adaptive Reading active)
+                              </div>
+                            )}
+                          </div>
+
+                          <div>
+                            <p className="text-xs font-medium uppercase tracking-wider opacity-70 mb-2">
+                              More tools
+                            </p>
+                            <div className="grid grid-cols-2 gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleSelectSettingsTab("translation")}
+                                className="h-9 text-xs font-medium"
+                              >
+                                Translation
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleSelectSettingsTab("audio")}
+                                className="h-9 text-xs font-medium"
+                              >
+                                Audio Reader
+                              </Button>
                             </div>
                           </div>
-                        </>
-                      )}
-                    </div>
-                  </>
-                )}
-
-                {settingsTab === "translation" && (
-                  <div className="mt-4">
-                    {fileType === "pdf" || fileType === "epub" ? (
-                      <>
-                        {!activeReflowBook && (reflow.status === "extracting" || epubExtracting) && (
-                          <div className="mb-3 rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs">
-                            {epubExtracting
-                              ? "Preparing EPUB chapters for translation..."
-                              : `Preparing book text (${reflow.progress}%)...`}
-                          </div>
-                        )}
-                        <TranslationPanel
-                          sourceLanguage={sourceLanguage}
-                          onChangeSourceLanguage={(code) => {
-                            setSourceLanguage(code);
-                            if (bookId) void saveDetectedLanguage(bookId, code);
-                          }}
-                          onAutoDetectSource={() => void handleAutoDetectSource()}
-                          isDetectingLanguage={isDetectingLanguage}
-                          targetLanguage={targetLanguage}
-                          onSelectAndTranslateLanguage={(code) => void handleSelectAndTranslateLanguage(code)}
-                          quality={translationQuality}
-                          onChangeQuality={setTranslationQuality}
-                          readingMode={translationReadingMode}
-                          onChangeReadingMode={setTranslationReadingMode}
-                          chapters={activeChapters}
-                          completedChapterIds={completedChapterIds}
-                          failedChapterIds={failedChapterIds}
-                          currentChapterIndex={currentChapterIndex}
-                          isTranslating={isTranslating}
-                          translationProgress={translationProgress}
-                          translationError={translationError}
-                          translationErrorCode={translationErrorCode}
-                          hasTranslatedSample={Object.keys(translatedMap).length > 0}
-                          onTranslateSample={() => void handleTranslateSample()}
-                          onTranslateChapter={(idx) => void handleTranslateSingleChapter(idx)}
-                          onTranslateFullBook={() => void handleTranslateFullBook()}
-                          onPauseTranslation={() => {
-                            translationAbortRef.current?.abort();
-                            setIsTranslating(false);
-                          }}
-                          onRetryFailed={() => void handleRetryFailedChapters()}
-                          onListenTranslated={() => {
-                            setListenInTranslated(true);
-                            handleSelectSettingsTab("audio");
-                          }}
-                        />
+                        </div>
                       </>
-                    ) : (
-                      <div className="py-6 text-center space-y-2 text-sm">
-                        <p className="font-medium">No readable book file attached</p>
-                        <p className="text-xs opacity-70">
-                          AI translation is available whenever a PDF or EPUB book file is attached.
-                        </p>
-                      </div>
                     )}
                   </div>
-                )}
+                </div>
+              )}
 
-                {settingsTab === "audio" && (
+              {settingsTab === "translation" && (
+                <div className="mx-auto max-w-2xl">
+                  {fileType === "pdf" || fileType === "epub" ? (
+                    <>
+                      {!activeReflowBook && (reflow.status === "extracting" || epubExtracting) && (
+                        <div className="mb-3 rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs">
+                          {epubExtracting
+                            ? "Preparing EPUB chapters for translation..."
+                            : `Preparing book text (${reflow.progress}%)...`}
+                        </div>
+                      )}
+                      <TranslationPanel
+                        sourceLanguage={sourceLanguage}
+                        onChangeSourceLanguage={(code) => {
+                          setSourceLanguage(code);
+                          if (bookId) void saveDetectedLanguage(bookId, code);
+                        }}
+                        onAutoDetectSource={() => void handleAutoDetectSource()}
+                        isDetectingLanguage={isDetectingLanguage}
+                        targetLanguage={targetLanguage}
+                        onSelectAndTranslateLanguage={(code) => void handleSelectAndTranslateLanguage(code)}
+                        quality={translationQuality}
+                        onChangeQuality={setTranslationQuality}
+                        readingMode={translationReadingMode}
+                        onChangeReadingMode={setTranslationReadingMode}
+                        chapters={activeChapters}
+                        completedChapterIds={completedChapterIds}
+                        failedChapterIds={failedChapterIds}
+                        currentChapterIndex={currentChapterIndex}
+                        isTranslating={isTranslating}
+                        translationProgress={translationProgress}
+                        translationError={translationError}
+                        translationErrorCode={translationErrorCode}
+                        hasTranslatedSample={Object.keys(translatedMap).length > 0}
+                        onTranslateSample={() => void handleTranslateSample()}
+                        onTranslateChapter={(idx) => void handleTranslateSingleChapter(idx)}
+                        onTranslateFullBook={() => void handleTranslateFullBook()}
+                        onPauseTranslation={() => {
+                          translationAbortRef.current?.abort();
+                          setIsTranslating(false);
+                        }}
+                        onRetryFailed={() => void handleRetryFailedChapters()}
+                        onListenTranslated={() => {
+                          setListenInTranslated(true);
+                          handleSelectSettingsTab("audio");
+                        }}
+                      />
+                    </>
+                  ) : (
+                    <div className="py-10 text-center space-y-2 text-sm">
+                      <p className="font-medium">No readable book file attached</p>
+                      <p className="text-xs opacity-70">
+                        AI translation is available whenever a PDF or EPUB book file is attached.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {settingsTab === "audio" && (
+                <div className="mx-auto max-w-2xl">
                   <AudioSettingsPanel
                     bookId={book.id}
                     hasReadableFile={(fileType === "pdf" || fileType === "epub") && !!book.book_url}
@@ -2018,15 +2551,16 @@ const BookReader = () => {
                         setTranslationReadingMode("translated");
                       }
                       jumpToBlock(seg.blockIndex);
+                      closeSettingsOverlay();
                     }}
                     onOpenTranslationTab={() => handleSelectSettingsTab("translation")}
                   />
-                )}
-              </SheetContent>
-            </Sheet>
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      </header>
+      )}
 
       {/* Table of Contents Sidebar */}
       {showToc && (
@@ -2307,9 +2841,23 @@ const BookReader = () => {
                     }}
                   >
                     <span className="truncate opacity-80">
-                      {translationReadingMode === "original"
-                        ? "Adaptive Reflow · Layouts may vary"
-                        : `Translation Active · ${getLanguageMeta(targetLanguage).name}`}
+                      {translationReadingMode !== "original"
+                        ? `Translation Active · ${getLanguageMeta(targetLanguage).name}`
+                        : activeReflowBook.meta.ocrPages || activeReflowBook.meta.rasterizedPages
+                          ? `Adaptive Flow · ${
+                              activeReflowBook.meta.ocrPages
+                                ? `${activeReflowBook.meta.ocrPages} OCR page${activeReflowBook.meta.ocrPages > 1 ? "s" : ""}`
+                                : ""
+                            }${
+                              activeReflowBook.meta.ocrPages && activeReflowBook.meta.rasterizedPages
+                                ? " · "
+                                : ""
+                            }${
+                              activeReflowBook.meta.rasterizedPages
+                                ? `${activeReflowBook.meta.rasterizedPages} image page${activeReflowBook.meta.rasterizedPages > 1 ? "s" : ""}`
+                                : ""
+                            }`
+                          : "Adaptive Flow · Layouts may vary"}
                     </span>
                     {translationReadingMode !== "original" ? (
                       <button
@@ -2362,12 +2910,18 @@ const BookReader = () => {
                             blockId: audiobook.activeSegment.blockId,
                             sentenceIndex: audiobook.activeSegment.sentenceIndex,
                             language: audiobook.activeSegment.language,
+                            status: audiobook.status === "idle" ? undefined : audiobook.status,
                           }
                         : null
                     }
+                    translatingIds={inlineTranslatingIds}
                     onSentenceClick={(bId, sIdx, isTranslatedCol) =>
                       void handleSentencePlayRequest(bId, sIdx, isTranslatedCol)
                     }
+                    onParagraphAudioClick={(bId, useTranslated) =>
+                      void handleParagraphAudio(bId, useTranslated)
+                    }
+                    onParagraphTranslateClick={(bId) => void handleParagraphTranslate(bId)}
                     onTranslateChapterAtBlock={(globalBlockIdx) => {
                       let targetChapIdx = 0;
                       for (let i = 0; i < activeChapters.length; i++) {
@@ -2392,10 +2946,38 @@ const BookReader = () => {
                         ? {
                             blockId: audiobook.activeSegment.blockId,
                             sentenceIndex: audiobook.activeSegment.sentenceIndex,
+                            charStart: audiobook.activeSegment.charStart,
+                            charEnd: audiobook.activeSegment.charEnd,
+                            status: audiobook.status === "idle" ? undefined : audiobook.status,
+                            isTranslatedSpeech:
+                              audiobook.activeSegment.language !== sourceLanguage &&
+                              translationReadingMode === "original",
                           }
                         : null
                     }
                     onSentenceClick={(bId, sIdx) => void handleSentencePlayRequest(bId, sIdx)}
+                    onParagraphAudioClick={(bId) => void handleParagraphAudio(bId)}
+                    onParagraphTranslateClick={(bId) => void handleParagraphTranslate(bId)}
+                    onCloseInlineTranslation={handleCloseInlineTranslation}
+                    inlineTranslations={
+                      translationReadingMode === "translated" ? originalBlockTextMap : translatedMap
+                    }
+                    inlineTranslationVisible={inlineTranslationVisible}
+                    inlineTranslatingIds={inlineTranslatingIds}
+                    inlineTranslateErrors={inlineTranslateErrors}
+                    inlineTranslationMeta={
+                      translationReadingMode === "translated"
+                        ? {
+                            languageName: getLanguageMeta(sourceLanguage).name,
+                            nativeName: "Original",
+                            dir: activeReflowBook?.meta.dir ?? "ltr",
+                          }
+                        : {
+                            languageName: getLanguageMeta(targetLanguage).name,
+                            nativeName: getLanguageMeta(targetLanguage).nativeName,
+                            dir: getLanguageMeta(targetLanguage).dir,
+                          }
+                    }
                     coverUrl={book.cover_url}
                     title={book.title}
                     author={book.author ?? undefined}
@@ -2478,6 +3060,8 @@ const BookReader = () => {
                 initialCfi={epubCfi}
                 onLocationChange={handleEpubLocationChange}
                 onTocExtracted={handleEpubTocExtracted}
+                onParagraphAudio={(text) => void handleEpubParagraphAudio(text)}
+                onParagraphTranslate={handleEpubParagraphTranslate}
                 onTap={toggleControls}
                 settings={readerSettings}
                 className="!h-full !min-h-0 w-full"
@@ -2588,13 +3172,13 @@ const BookReader = () => {
             </div>
           )}
 
-          {/* Tap zones for mobile/tablet on EPUB */}
-          {fileType === "epub" && (
-            <div className="absolute inset-0 z-30 md:hidden flex pointer-events-none">
+          {/* Edge tap zones for mobile/tablet on Original EPUB (center stays clear for paragraph buttons & text) */}
+          {fileType === "epub" && translationReadingMode === "original" && (
+            <div className="absolute inset-0 z-30 md:hidden flex justify-between pointer-events-none">
               <button
                 type="button"
                 aria-label="Previous page"
-                className="h-full w-[30%] pointer-events-auto bg-transparent"
+                className="h-full w-[14%] pointer-events-auto bg-transparent"
                 style={{ touchAction: "pan-y" }}
                 onClick={(e) => {
                   e.stopPropagation();
@@ -2603,18 +3187,8 @@ const BookReader = () => {
               />
               <button
                 type="button"
-                aria-label="Toggle controls"
-                className="h-full w-[40%] pointer-events-auto bg-transparent"
-                style={{ touchAction: "pan-y" }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  toggleControls();
-                }}
-              />
-              <button
-                type="button"
                 aria-label="Next page"
-                className="h-full w-[30%] pointer-events-auto bg-transparent"
+                className="h-full w-[14%] pointer-events-auto bg-transparent"
                 style={{ touchAction: "pan-y" }}
                 onClick={(e) => {
                   e.stopPropagation();

@@ -4,6 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/contexts/AuthContext';
 import { compressImage } from '@/lib/media/compressImage';
 import { computeExpiresAt, isStatusActive } from '@/lib/promotions/statusDuration';
+import { isSchemaMissingError } from '@/integrations/supabase/config';
 
 export interface AppPromotion {
   id: string;
@@ -125,7 +126,10 @@ export function useAppPromotions() {
         .gt('expires_at', nowIso)
         .order('created_at', { ascending: true });
 
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return [];
+        throw error;
+      }
       return (data ?? []) as AppPromotion[];
     },
     staleTime: 1000 * 30,

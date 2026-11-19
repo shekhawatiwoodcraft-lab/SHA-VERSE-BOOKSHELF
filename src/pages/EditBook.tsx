@@ -12,6 +12,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ArrowLeft, Book, Loader2, Upload } from "lucide-react";
 import { BOOK_PUBLIC_COLUMNS } from "@/lib/constants/bookshelf";
+import { useSmartBack } from "@/lib/navigation";
 
 const CATEGORIES = [
   "Fiction", "Self-Help", "Education", "Comic", "Biography",
@@ -22,6 +23,7 @@ const CATEGORIES = [
 const EditBook = () => {
   const { bookId } = useParams<{ bookId: string }>();
   const navigate = useNavigate();
+  const handleBack = useSmartBack(bookId ? `/bookshelf/book/${bookId}` : "/bookshelf");
   const { user } = useAuth();
   const queryClient = useQueryClient();
 
@@ -197,7 +199,7 @@ const EditBook = () => {
       {/* Header */}
       <header className="sticky top-0 z-40 bg-card/80 backdrop-blur-lg border-b">
         <div className="max-w-4xl mx-auto px-4 py-3 flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+          <Button variant="ghost" size="icon" aria-label="Back" onClick={() => handleBack()}>
             <ArrowLeft className="w-5 h-5" />
           </Button>
           <h1 className="font-semibold flex-1">Edit Book</h1>
@@ -306,7 +308,7 @@ const EditBook = () => {
 
           {/* Action Buttons */}
           <div className="flex gap-4 pt-6 border-t">
-            <Button variant="outline" onClick={() => navigate(-1)}>
+            <Button variant="outline" onClick={() => handleBack()}>
               Cancel
             </Button>
             <Button

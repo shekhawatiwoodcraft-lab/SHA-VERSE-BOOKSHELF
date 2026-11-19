@@ -13,14 +13,22 @@ import {
 } from "./src/lib/ai/languages";
 import {
   detectDialogueParts,
+  parseModelJson,
   validateTranslationBatch,
 } from "./src/lib/ai/segments";
+import { resolveSupabaseConfig } from "./src/integrations/supabase/config";
 
 const PORT = Number(process.env.PORT || 3000);
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || "https://plmhjuqedtkiffzhberf.supabase.co";
-const SUPABASE_ANON_KEY =
-  process.env.VITE_SUPABASE_PUBLISHABLE_KEY || "sb_publishable_1dTDQtOkjQWkpk3GAoFqSg_wFHFPDFU";
+const SUPABASE_ENABLED = true;
+const resolvedSupabase = resolveSupabaseConfig({
+  url: process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL,
+  key: process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+});
+const SUPABASE_URL = SUPABASE_ENABLED ? resolvedSupabase.url : "";
+const SUPABASE_ANON_KEY = SUPABASE_ENABLED ? resolvedSupabase.publishableKey : "";
+const SUPABASE_AUTH_CONFIGURED = Boolean(SUPABASE_ENABLED && SUPABASE_URL && SUPABASE_ANON_KEY);
 
+const FAST_TRANSLATION_MODEL = "gemini-3.1-flash-lite";
 const TRANSLATION_MODEL = "gemini-4-hydrogen";
 const TTS_STANDARD_MODEL = "gemini-3.8-flash-lite-tts";
 const TTS_DIALOGUE_MODEL = "gemini-3.8-flash-tts";
@@ -28,16 +36,19 @@ const TTS_DIALOGUE_MODEL = "gemini-3.8-flash-tts";
 // Server-side LRU caches (in-memory) + in-flight deduplication
 const MAX_TRANSLATION_CACHE = 400;
 const MAX_AUDIO_CACHE = 240;
+const MAX_AUTH_CACHE = 500;
+const AUTH_CACHE_TTL_MS = 120_000;
 
 const translationCache = new Map<string, { items: Array<{ id: string; translatedText: string }>; glossaryAdditions: Array<{ source: string; target: string }> }>();
 const audioCache = new Map<string, Buffer>();
 const inflightTts = new Map<string, Promise<Buffer>>();
 const inflightTranslations = new Map<string, Promise<{ items: Array<{ id: string; translatedText: string }>; glossaryAdditions: Array<{ source: string; target: string }> }>>();
+const verifiedAuthCache = new Map<string, { callerId: string; expiresAt: number }>();
 
 // Simple per-caller sliding-window rate limiter
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX_REQ = 90;
+const RATE_LIMIT_MAX_REQ = 150;
 
 function checkRateLimit(key: string): boolean {
   const now = Date.now();
@@ -56,7 +67,9 @@ function getGenAiClient(): GoogleGenAI | null {
   if (!apiKey || apiKey === "MY_GEMINI_API_KEY") return null;
   return new GoogleGenAI({
     apiKey,
+    apiVersion: "v1beta",
     httpOptions: {
+      timeout: 30_000,
       headers: {
         "User-Agent": "aistudio-build",
       },
@@ -78,18 +91,59 @@ function setBoundedCache<K, V>(map: Map<K, V>, key: K, value: V, limit: number) 
   }
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+/**
+ * Ensures TTS audio buffer has a valid RIFF/WAV container so browser <audio>
+ * elements always decode cleanly even if provider returns raw PCM (audio/L16).
+ */
+function ensurePlayableWavBuffer(rawBuffer: Buffer, mimeType?: string): Buffer {
+  if (
+    rawBuffer.length >= 12 &&
+    rawBuffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    rawBuffer.subarray(8, 12).toString("ascii") === "WAVE"
+  ) {
+    return rawBuffer;
+  }
+  const rateMatch = /rate=(\d+)/i.exec(mimeType || "");
+  const sampleRate = rateMatch ? Math.max(8000, Math.min(96000, Number(rateMatch[1]))) : 24000;
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + rawBuffer.length, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(rawBuffer.length, 40);
+  return Buffer.concat([header, rawBuffer]);
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err: unknown) {
       lastErr = err;
+      const errName = (err as { name?: string })?.name || "";
+      const errMsg = err instanceof Error ? err.message : String(err || "");
+      if (errName === "AbortError" || /timeout|timed out|aborted/i.test(errMsg)) {
+        break;
+      }
       const status = Number((err as { status?: number })?.status || 0);
-      const retryable = status === 429 || status >= 500 || status === 0;
+      // Fail fast on 429 so we don't stall UX or multiply upstream RPM load.
+      if (status === 429 || /RESOURCE_EXHAUSTED|rate limit/i.test(errMsg)) break;
+      const retryable = status >= 500;
       if (!retryable || attempt === maxRetries) break;
-      const delay = 500 * Math.pow(2, attempt);
-      await new Promise((r) => setTimeout(r, delay));
+      await new Promise((r) => setTimeout(r, 250 + Math.floor(Math.random() * 120)));
     }
   }
   throw lastErr;
@@ -97,6 +151,13 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
 
 async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: string; status?: number; message?: string }> {
   const authHeader = req.headers.authorization || "";
+  if (!SUPABASE_AUTH_CONFIGURED) {
+    // Disconnected from legacy Supabase: identify caller safely for rate-limiting without calling external auth.
+    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+    const callerKey = token ? sha256(token).slice(0, 12) : `anon-${sha256(req.ip || "local").slice(0, 12)}`;
+    return { ok: true, callerId: callerKey };
+  }
+
   if (!authHeader.startsWith("Bearer ")) {
     return { ok: false, callerId: "anon", status: 401, message: "Authentication required for AI reading features." };
   }
@@ -105,7 +166,17 @@ async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: 
     return { ok: false, callerId: "anon", status: 401, message: "Missing authentication token." };
   }
 
-  // Verify token against Supabase Auth when reachable; if token is a local preview test token skip only in non-prod
+  const tokenHash = sha256(token);
+  const now = Date.now();
+  const cached = verifiedAuthCache.get(tokenHash);
+  if (cached && cached.expiresAt > now) {
+    return { ok: true, callerId: cached.callerId };
+  }
+  if (cached) {
+    verifiedAuthCache.delete(tokenHash);
+  }
+
+  // Verify token against configured Auth server when reachable
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
@@ -120,15 +191,23 @@ async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: 
 
     if (resp.ok) {
       const user = (await resp.json()) as { id?: string };
-      return { ok: true, callerId: user.id || sha256(token).slice(0, 12) };
+      const callerId = user.id || tokenHash.slice(0, 12);
+      setBoundedCache(
+        verifiedAuthCache,
+        tokenHash,
+        { callerId, expiresAt: now + AUTH_CACHE_TTL_MS },
+        MAX_AUTH_CACHE,
+      );
+      return { ok: true, callerId };
     }
     if (resp.status === 401 || resp.status === 403) {
+      verifiedAuthCache.delete(tokenHash);
       return { ok: false, callerId: "invalid", status: 401, message: "Session expired or invalid. Please sign in again." };
     }
   } catch {
     // Transient network drop to auth server: rate-limit by hashed token instead of failing offline-capable previews
   }
-  return { ok: true, callerId: sha256(token).slice(0, 12) };
+  return { ok: true, callerId: tokenHash.slice(0, 12) };
 }
 
 function mapAiError(err: unknown): { status: number; code: string; message: string } {
@@ -168,7 +247,7 @@ async function startServer() {
     res.json({
       configured,
       models: {
-        translation: TRANSLATION_MODEL,
+        translation: FAST_TRANSLATION_MODEL,
         tts: TTS_STANDARD_MODEL,
         dialogueTts: TTS_DIALOGUE_MODEL,
       },
@@ -202,7 +281,7 @@ async function startServer() {
       });
     }
 
-    const sampleText = typeof req.body?.sampleText === "string" ? req.body.sampleText.trim().slice(0, 3500) : "";
+    const sampleText = typeof req.body?.sampleText === "string" ? req.body.sampleText.trim().slice(0, 2200) : "";
     if (!sampleText) {
       return res.status(400).json({ error: "sampleText is required." });
     }
@@ -210,10 +289,10 @@ async function startServer() {
     try {
       const response = await withRetry(() =>
         ai.models.generateContent({
-          model: TRANSLATION_MODEL,
+          model: FAST_TRANSLATION_MODEL,
           contents: `Detect the primary language of this book excerpt and return its ISO 639-1 code (e.g., en, hi, ur, ar, bn, es, fr, de, pt, zh, ja, ko, ru, tr, id).\n\nExcerpt:\n${sampleText}`,
           config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
             responseMimeType: "application/json",
             responseSchema: {
               type: Type.OBJECT,
@@ -228,11 +307,11 @@ async function startServer() {
         }),
       );
 
-      const parsed = JSON.parse((response.text || "{}").trim()) as {
+      const parsed = parseModelJson<{
         languageCode?: string;
         languageName?: string;
         confidence?: number;
-      };
+      }>(response.text || "{}");
       const meta = getLanguageMeta(parsed.languageCode || "en");
       res.json({
         languageCode: meta.code,
@@ -300,9 +379,11 @@ async function startServer() {
 
     const srcMeta = getLanguageMeta(sourceLanguage);
     const tgtMeta = getLanguageMeta(targetLanguage);
+    const useLiteraryModel = quality === "literary" && sanitizedBlocks.length > 1;
+    const selectedModel = useLiteraryModel ? TRANSLATION_MODEL : FAST_TRANSLATION_MODEL;
     const cacheKey = sha256(
       JSON.stringify({
-        m: TRANSLATION_MODEL,
+        m: selectedModel,
         src: srcMeta.code,
         tgt: tgtMeta.code,
         q: quality,
@@ -319,12 +400,7 @@ async function startServer() {
     let pending = inflightTranslations.get(cacheKey);
     if (!pending) {
       pending = (async () => {
-        const thinkingLevel =
-          quality === "literary"
-            ? ThinkingLevel.HIGH
-            : quality === "high"
-              ? ThinkingLevel.MEDIUM
-              : ThinkingLevel.LOW;
+        const thinkingLevel = useLiteraryModel ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
 
         const qualityInstruction =
           quality === "literary"
@@ -336,15 +412,15 @@ async function startServer() {
         const glossaryText =
           Array.isArray(glossary) && glossary.length > 0
             ? glossary
-                .slice(0, 40)
+                .slice(0, 30)
                 .map((g) => `- "${g.source}" -> "${g.target}"`)
                 .join("\n")
-            : "(None yet — establish consistent character names and key terms)";
+            : "";
 
         const contextText =
           Array.isArray(previousContext) && previousContext.length > 0
-            ? previousContext.slice(-3).join("\n")
-            : "(Start of section)";
+            ? previousContext.slice(-2).join("\n")
+            : "";
 
         const systemInstruction = [
           `You are a professional literary and technical book translator translating from ${srcMeta.name} (${srcMeta.code}) into ${tgtMeta.name} (${tgtMeta.nativeName}, ${tgtMeta.code}).`,
@@ -360,8 +436,8 @@ async function startServer() {
 
         const userPrompt = [
           bookTitle ? `Book title: ${bookTitle}` : "",
-          `Approved Glossary:\n${glossaryText}`,
-          `Preceding Context (reference only, do not include in output):\n${contextText}`,
+          glossaryText ? `Approved Glossary:\n${glossaryText}` : "",
+          contextText ? `Preceding Context (reference only, do not include in output):\n${contextText}` : "",
           `Segments to translate (JSON):\n${JSON.stringify(sanitizedBlocks)}`,
         ]
           .filter(Boolean)
@@ -369,7 +445,7 @@ async function startServer() {
 
         const response = await withRetry(() =>
           ai.models.generateContent({
-            model: TRANSLATION_MODEL,
+            model: selectedModel,
             contents: userPrompt,
             config: {
               systemInstruction,
@@ -407,10 +483,10 @@ async function startServer() {
           }),
         );
 
-        const parsed = JSON.parse((response.text || "{}").trim()) as {
+        const parsed = parseModelJson<{
           items?: Array<{ id: string; translatedText: string }>;
           glossaryAdditions?: Array<{ source: string; target: string }>;
-        };
+        }>(response.text || "{}");
 
         const items = Array.isArray(parsed.items) ? parsed.items : [];
         const check = validateTranslationBatch(
@@ -583,11 +659,12 @@ async function startServer() {
           );
         }
 
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const inline = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        const base64Audio = inline?.data;
         if (!base64Audio) {
           throw new Error("TTS provider returned no audio data for this segment.");
         }
-        const wavBuffer = Buffer.from(base64Audio, "base64");
+        const wavBuffer = ensurePlayableWavBuffer(Buffer.from(base64Audio, "base64"), inline?.mimeType);
         setBoundedCache(audioCache, cacheKey, wavBuffer, MAX_AUDIO_CACHE);
         return wavBuffer;
       })();
@@ -651,45 +728,58 @@ async function startServer() {
       return res.send(cached);
     }
 
-    try {
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: TTS_STANDARD_MODEL,
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: cleanSample,
-                  speechMetadata: {
-                    style: `${styleObj.promptHint} in ${langMeta.name}`,
+    let pending = inflightTts.get(cacheKey);
+    if (!pending) {
+      pending = (async () => {
+        const response = await withRetry(() =>
+          ai.models.generateContent({
+            model: TTS_STANDARD_MODEL,
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: cleanSample,
+                    speechMetadata: {
+                      style: `${styleObj.promptHint} in ${langMeta.name}`,
+                    },
                   },
+                ],
+              },
+            ],
+            config: {
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: primaryVoice },
                 },
-              ],
-            },
-          ],
-          config: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: primaryVoice },
               },
             },
-          },
-        }),
-      );
+          }),
+        );
 
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (!base64Audio) {
-        return res.status(502).json({ error: "Unable to generate voice preview." });
-      }
-      const wavBuffer = Buffer.from(base64Audio, "base64");
-      setBoundedCache(audioCache, cacheKey, wavBuffer, MAX_AUDIO_CACHE);
+        const inline = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        const base64Audio = inline?.data;
+        if (!base64Audio) {
+          throw new Error("Unable to generate voice preview.");
+        }
+        const wavBuffer = ensurePlayableWavBuffer(Buffer.from(base64Audio, "base64"), inline?.mimeType);
+        setBoundedCache(audioCache, cacheKey, wavBuffer, MAX_AUDIO_CACHE);
+        return wavBuffer;
+      })();
+
+      inflightTts.set(cacheKey, pending);
+    }
+
+    try {
+      const wavBuffer = await pending;
       res.setHeader("Content-Type", "audio/wav");
       res.send(wavBuffer);
     } catch (err) {
       const mapped = mapAiError(err);
       res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
+    } finally {
+      inflightTts.delete(cacheKey);
     }
   });
 

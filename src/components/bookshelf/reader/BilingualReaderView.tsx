@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { Languages, Sparkles } from "lucide-react";
+import { Languages, Loader2, Pause, Sparkles, Volume2 } from "lucide-react";
 import type { Block, Chapter, Direction, ReflowBook } from "@/lib/reader/types";
 import {
   READER_FONT_STACKS,
@@ -19,8 +19,16 @@ interface BilingualReaderViewProps {
   targetLanguage: string;
   mode: "side_by_side" | "paragraph_by_paragraph";
   settings: ReaderSettings;
-  activeSpeech?: { blockId: string; sentenceIndex: number; language: string } | null;
+  activeSpeech?: {
+    blockId: string;
+    sentenceIndex: number;
+    language: string;
+    status?: "loading" | "playing" | "paused" | "error";
+  } | null;
+  translatingIds?: Record<string, boolean>;
   onSentenceClick?: (blockId: string, sentenceIndex: number, isTranslatedSide: boolean) => void;
+  onParagraphAudioClick?: (blockId: string, useTranslated?: boolean) => void;
+  onParagraphTranslateClick?: (blockId: string) => void;
   onTranslateChapterAtBlock?: (blockIndex: number) => void;
   onTap?: () => void;
 }
@@ -35,6 +43,27 @@ function renderSentences(params: {
   onClickSentence?: (blockId: string, sentenceIndex: number, isTranslatedSide: boolean) => void;
 }) {
   const { text, blockId, isTranslatedSide, activeSpeech, speechMatchesThisColumn, accentColor, onClickSentence } = params;
+  if (speechMatchesThisColumn && activeSpeech?.blockId === blockId && activeSpeech.sentenceIndex === -1) {
+    return (
+      <span
+        data-active-speech="true"
+        onClick={(e) => {
+          if (!onClickSentence) return;
+          e.stopPropagation();
+          onClickSentence(blockId, 0, isTranslatedSide);
+        }}
+        className={cn(onClickSentence && "cursor-pointer hover:underline decoration-dotted")}
+        style={{
+          backgroundColor: `${accentColor}26`,
+          borderRadius: 4,
+          padding: "1px 3px",
+        }}
+      >
+        {text}
+      </span>
+    );
+  }
+
   const sentences = splitIntoSentences(text);
   if (sentences.length <= 1) {
     const isActive = speechMatchesThisColumn && activeSpeech?.blockId === blockId && activeSpeech.sentenceIndex === 0;
@@ -101,7 +130,10 @@ export default function BilingualReaderView({
   mode,
   settings,
   activeSpeech,
+  translatingIds,
   onSentenceClick,
+  onParagraphAudioClick,
+  onParagraphTranslateClick,
   onTranslateChapterAtBlock,
   onTap,
 }: BilingualReaderViewProps) {
@@ -135,6 +167,72 @@ export default function BilingualReaderView({
 
   const speechOnTranslated = activeSpeech?.language === tgtMeta.code;
   const speechOnOriginal = activeSpeech?.language === srcMeta.code || !speechOnTranslated;
+
+  const renderBlockActionIcons = (blockId: string, translatedReady: boolean) => {
+    const isAudioBlock = activeSpeech?.blockId === blockId;
+    const isLoadingAudio = isAudioBlock && activeSpeech?.status === "loading";
+    const isPlayingAudio = isAudioBlock && activeSpeech?.status === "playing";
+    const isTranslatingBlock = Boolean(translatingIds?.[blockId]);
+
+    return (
+      <span
+        data-reader-toolbar
+        dir="ltr"
+        className="float-end ms-2 inline-flex items-center gap-0.5 select-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {onParagraphAudioClick && (
+          <button
+            type="button"
+            aria-label={isPlayingAudio ? "Pause paragraph audio" : "Listen to paragraph"}
+            title={isPlayingAudio ? "Pause audio" : "Listen to paragraph"}
+            onClick={(e) => {
+              e.stopPropagation();
+              onParagraphAudioClick(blockId, translatedReady);
+            }}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:opacity-100"
+            style={{
+              color: isAudioBlock ? theme.accent : theme.muted,
+              backgroundColor: isAudioBlock ? `${theme.accent}1f` : "transparent",
+              opacity: isAudioBlock ? 1 : 0.72,
+            }}
+          >
+            {isLoadingAudio ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : isPlayingAudio ? (
+              <Pause className="h-3.5 w-3.5" />
+            ) : (
+              <Volume2 className="h-3.5 w-3.5" />
+            )}
+          </button>
+        )}
+        {onParagraphTranslateClick && (
+          <button
+            type="button"
+            aria-label={isTranslatingBlock ? "Translating paragraph" : "Translate paragraph"}
+            title={translatedReady ? "Retranslate or view paragraph" : "Translate this paragraph"}
+            onClick={(e) => {
+              e.stopPropagation();
+              onParagraphTranslateClick(blockId);
+            }}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:opacity-100"
+            style={{
+              color: translatedReady || isTranslatingBlock ? theme.accent : theme.muted,
+              backgroundColor:
+                translatedReady || isTranslatingBlock ? `${theme.accent}1f` : "transparent",
+              opacity: translatedReady || isTranslatingBlock ? 1 : 0.72,
+            }}
+          >
+            {isTranslatingBlock ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Languages className="h-3.5 w-3.5" />
+            )}
+          </button>
+        )}
+      </span>
+    );
+  };
 
   return (
     <div
@@ -187,6 +285,7 @@ export default function BilingualReaderView({
                     lineHeight: settings.lineHeight,
                   }}
                 >
+                  {renderBlockActionIcons(block.id, Boolean(translated))}
                   {renderSentences({
                     text: block.text,
                     blockId: block.id,
@@ -260,6 +359,7 @@ export default function BilingualReaderView({
                   lineHeight: settings.lineHeight,
                 }}
               >
+                {renderBlockActionIcons(block.id, Boolean(translated))}
                 {renderSentences({
                   text: block.text,
                   blockId: block.id,

@@ -381,10 +381,20 @@ const PagedFlow = forwardRef<PagedFlowHandle, Props>(
         className={cn("relative h-full w-full select-text overflow-hidden", className)}
         style={{ touchAction: "pan-y", ...style }}
         onTouchStart={(event) => {
+          const target = event.target as HTMLElement | null;
+          if (target?.closest("[data-reader-toolbar]")) {
+            touchRef.current = null;
+            return;
+          }
           const touch = event.touches[0];
           touchRef.current = { x: touch.clientX, y: touch.clientY, time: Date.now() };
         }}
         onTouchEnd={(event) => {
+          const target = event.target as HTMLElement | null;
+          if (target?.closest("[data-reader-toolbar]")) {
+            touchRef.current = null;
+            return;
+          }
           const start = touchRef.current;
           touchRef.current = null;
           lastTouchRef.current = Date.now();

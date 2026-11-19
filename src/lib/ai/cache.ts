@@ -81,12 +81,45 @@ const sbUntyped = supabase as unknown as {
   from: (table: string) => DynamicTableQuery;
 };
 
-async function safeGetUserAndToken(): Promise<{ userId: string | null; accessToken: string | null }> {
+const missingRemoteTables = new Set<string>();
+
+function isTableMissingError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: string; status?: number; message?: string };
+  return e.code === "PGRST205" || e.status === 404 || /does not exist|schema cache|404/i.test(e.message || "");
+}
+
+function noteRemoteResult(table: string, error: unknown): boolean {
+  if (!error) return false;
+  if (isTableMissingError(error)) {
+    missingRemoteTables.add(table);
+  }
+  return true;
+}
+
+async function safeGetUserAndToken(forceRefresh = false): Promise<{ userId: string | null; accessToken: string | null }> {
   try {
     const { data } = await supabase.auth.getSession();
+    const session = data.session;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const needsRefresh =
+      forceRefresh ||
+      !session?.access_token ||
+      (typeof session.expires_at === "number" && session.expires_at - nowSec < 60);
+
+    if (needsRefresh) {
+      const refreshed = await supabase.auth.refreshSession().catch(() => null);
+      if (refreshed?.data?.session) {
+        return {
+          userId: refreshed.data.session.user?.id ?? null,
+          accessToken: refreshed.data.session.access_token ?? null,
+        };
+      }
+    }
+
     return {
-      userId: data.session?.user?.id ?? null,
-      accessToken: data.session?.access_token ?? null,
+      userId: session?.user?.id ?? null,
+      accessToken: session?.access_token ?? null,
     };
   } catch {
     return { userId: null, accessToken: null };
@@ -94,7 +127,12 @@ async function safeGetUserAndToken(): Promise<{ userId: string | null; accessTok
 }
 
 export async function getAuthTokenForAi(): Promise<string | null> {
-  const { accessToken } = await safeGetUserAndToken();
+  const { accessToken } = await safeGetUserAndToken(false);
+  return accessToken;
+}
+
+export async function refreshAuthTokenForAi(): Promise<string | null> {
+  const { accessToken } = await safeGetUserAndToken(true);
   return accessToken;
 }
 
@@ -135,10 +173,11 @@ export async function loadCachedTranslation(
   }
 
   // Best-effort remote restore if IndexedDB was cleared
+  if (missingRemoteTables.has("book_translations")) return null;
   try {
     const { userId } = await safeGetUserAndToken();
     if (!userId) return null;
-    const { data: bt } = await sbUntyped
+    const { data: bt, error: btErr } = await sbUntyped
       .from("book_translations")
       .select("id, original_language, target_language, translation_quality, glossary, updated_at")
       .eq("user_id", userId)
@@ -147,7 +186,7 @@ export async function loadCachedTranslation(
       .eq("translation_quality", quality)
       .maybeSingle();
 
-    if (!bt?.id) return null;
+    if (noteRemoteResult("book_translations", btErr) || !bt?.id) return null;
     const { data: chapters } = await sbUntyped
       .from("translated_chapters")
       .select("original_chapter_id, translated_content, translation_status")
@@ -204,11 +243,12 @@ export async function syncTranslatedChapterRemote(params: {
   glossary: GlossaryEntry[];
   status: string;
 }): Promise<void> {
+  if (missingRemoteTables.has("book_translations")) return;
   try {
     const { userId } = await safeGetUserAndToken();
     if (!userId) return;
 
-    const { data: upserted } = await sbUntyped
+    const { data: upserted, error: upsertErr } = await sbUntyped
       .from("book_translations")
       .upsert(
         {
@@ -226,7 +266,7 @@ export async function syncTranslatedChapterRemote(params: {
       .select("id")
       .maybeSingle();
 
-    if (!upserted?.id) return;
+    if (noteRemoteResult("book_translations", upsertErr) || !upserted?.id) return;
 
     await sbUntyped.from("translated_chapters").upsert(
       {
@@ -297,16 +337,17 @@ export async function loadListeningProgress(bookId: string): Promise<ListeningPr
     /* ignore */
   }
 
+  if (missingRemoteTables.has("listening_progress")) return null;
   try {
     const { userId } = await safeGetUserAndToken();
     if (!userId) return null;
-    const { data } = await sbUntyped
+    const { data, error } = await sbUntyped
       .from("listening_progress")
       .select("*")
       .eq("user_id", userId)
       .eq("book_id", bookId)
       .maybeSingle();
-    if (!data) return null;
+    if (noteRemoteResult("listening_progress", error) || !data) return null;
     const restored: ListeningProgressRecord = {
       bookId,
       language: data.language || "en",
@@ -333,10 +374,11 @@ export async function saveListeningProgress(record: ListeningProgressRecord): Pr
     /* ignore */
   }
 
+  if (missingRemoteTables.has("listening_progress")) return;
   try {
     const { userId } = await safeGetUserAndToken();
     if (!userId) return;
-    await sbUntyped.from("listening_progress").upsert(
+    const res = await (sbUntyped.from("listening_progress").upsert(
       {
         user_id: userId,
         book_id: record.bookId,
@@ -350,7 +392,8 @@ export async function saveListeningProgress(record: ListeningProgressRecord): Pr
         updated_at: new Date().toISOString(),
       },
       { onConflict: "user_id,book_id" },
-    );
+    ) as unknown as Promise<{ error?: unknown }>);
+    noteRemoteResult("listening_progress", res?.error);
   } catch {
     /* graceful no-op if remote migration not applied */
   }
@@ -376,11 +419,12 @@ export function saveVoicePreferencesSync(prefs: UserVoicePreferences): void {
     /* ignore */
   }
 
+  if (missingRemoteTables.has("user_voice_preferences")) return;
   void (async () => {
     try {
       const { userId } = await safeGetUserAndToken();
       if (!userId) return;
-      await sbUntyped.from("user_voice_preferences").upsert(
+      const res = await (sbUntyped.from("user_voice_preferences").upsert(
         {
           user_id: userId,
           preferred_target_language: prefs.preferredTargetLanguage,
@@ -393,7 +437,8 @@ export function saveVoicePreferencesSync(prefs: UserVoicePreferences): void {
           updated_at: new Date().toISOString(),
         },
         { onConflict: "user_id" },
-      );
+      ) as unknown as Promise<{ error?: unknown }>);
+      noteRemoteResult("user_voice_preferences", res?.error);
     } catch {
       /* graceful no-op */
     }

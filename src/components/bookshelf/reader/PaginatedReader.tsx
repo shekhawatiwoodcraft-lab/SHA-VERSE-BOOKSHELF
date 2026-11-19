@@ -15,7 +15,7 @@
  * stays anchored to the exact same sentence.
  */
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Highlighter, StickyNote, Copy, X } from "lucide-react";
+import { Highlighter, StickyNote, Copy, X, Volume2, Pause, Languages, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Block, Highlight, ImageBlock, ReflowBook } from "@/lib/reader/types";
 import { isHiddenMetadata, normalizeReaderText } from "@/lib/reader/sanitize";
@@ -48,6 +48,15 @@ export interface PaginationInfo {
   chapterTitle: string;
 }
 
+export interface ActiveSpeechInfo {
+  blockId: string;
+  sentenceIndex: number;
+  charStart?: number;
+  charEnd?: number;
+  status?: "loading" | "playing" | "paused" | "error";
+  isTranslatedSpeech?: boolean;
+}
+
 interface Props {
   book: ReflowBook;
   settings: ReaderSettings;
@@ -56,8 +65,20 @@ interface Props {
   jumpTo?: { blockIndex: number; token: number } | null;
   /** Imperative viewport flip request from external controls. */
   navRequest?: { delta: number; token: number } | null;
-  activeSpeech?: { blockId: string; sentenceIndex: number } | null;
+  activeSpeech?: ActiveSpeechInfo | null;
   onSentenceClick?: (blockId: string, sentenceIndex: number) => void;
+  onParagraphAudioClick?: (blockId: string) => void;
+  onParagraphTranslateClick?: (blockId: string) => void;
+  onCloseInlineTranslation?: (blockId: string) => void;
+  inlineTranslations?: Record<string, string>;
+  inlineTranslationVisible?: Record<string, boolean>;
+  inlineTranslatingIds?: Record<string, boolean>;
+  inlineTranslateErrors?: Record<string, string>;
+  inlineTranslationMeta?: {
+    languageName: string;
+    nativeName: string;
+    dir: "ltr" | "rtl";
+  };
   coverUrl?: string | null;
   title?: string;
   author?: string;
@@ -215,15 +236,35 @@ const BlockView = memo(
     settings,
     highlights,
     searchQuery,
-    activeSentenceIndex,
+    activeSpeechForBlock,
     onSentenceDoubleClick,
+    onParagraphAudioClick,
+    onParagraphTranslateClick,
+    onCloseInlineTranslation,
+    inlineTranslatedText,
+    isInlineTranslationVisible,
+    isInlineTranslating,
+    inlineTranslateError,
+    inlineTranslationMeta,
   }: {
     block: Block;
     settings: ReaderSettings;
     highlights: Highlight[];
     searchQuery?: string;
-    activeSentenceIndex?: number | null;
+    activeSpeechForBlock?: ActiveSpeechInfo | null;
     onSentenceDoubleClick?: (blockId: string, sentenceIndex: number) => void;
+    onParagraphAudioClick?: (blockId: string) => void;
+    onParagraphTranslateClick?: (blockId: string) => void;
+    onCloseInlineTranslation?: (blockId: string) => void;
+    inlineTranslatedText?: string;
+    isInlineTranslationVisible?: boolean;
+    isInlineTranslating?: boolean;
+    inlineTranslateError?: string;
+    inlineTranslationMeta?: {
+      languageName: string;
+      nativeName: string;
+      dir: "ltr" | "rtl";
+    };
   }) => {
     const theme = READER_THEMES[settings.theme];
 
@@ -275,18 +316,46 @@ const BlockView = memo(
     }
 
     const text = block.text;
-    const speechRanges: TextRange[] = [];
-    if (typeof activeSentenceIndex === "number" && activeSentenceIndex >= 0) {
-      const spans = splitIntoSentences(text);
-      const targetSpan = spans[activeSentenceIndex] ?? spans[0];
-      if (targetSpan) {
-        speechRanges.push({
-          start: targetSpan.start,
-          end: targetSpan.end,
-          kind: "speech",
-        });
+    const speakingInlineCard = Boolean(
+      activeSpeechForBlock?.isTranslatedSpeech && isInlineTranslationVisible && inlineTranslatedText,
+    );
+    const computeSpeechRanges = (targetText: string): TextRange[] => {
+      if (!activeSpeechForBlock) return [];
+      if (
+        typeof activeSpeechForBlock.charStart === "number" &&
+        typeof activeSpeechForBlock.charEnd === "number" &&
+        activeSpeechForBlock.charEnd > activeSpeechForBlock.charStart
+      ) {
+        return [
+          {
+            start: Math.max(0, activeSpeechForBlock.charStart),
+            end: Math.min(targetText.length, activeSpeechForBlock.charEnd),
+            kind: "speech",
+          },
+        ];
       }
-    }
+      if (activeSpeechForBlock.sentenceIndex === -1) {
+        return [{ start: 0, end: targetText.length, kind: "speech" }];
+      }
+      if (activeSpeechForBlock.sentenceIndex >= 0) {
+        const spans = splitIntoSentences(targetText);
+        const targetSpan = spans[activeSpeechForBlock.sentenceIndex] ?? spans[0];
+        if (targetSpan) {
+          return [{ start: targetSpan.start, end: targetSpan.end, kind: "speech" }];
+        }
+      }
+      return [];
+    };
+
+    const speechRanges: TextRange[] = !activeSpeechForBlock
+      ? []
+      : speakingInlineCard
+        ? []
+        : activeSpeechForBlock.isTranslatedSpeech
+          ? [{ start: 0, end: text.length, kind: "speech" }]
+          : computeSpeechRanges(text);
+    const inlineSpeechRanges: TextRange[] =
+      speakingInlineCard && inlineTranslatedText ? computeSpeechRanges(inlineTranslatedText) : [];
 
     // `highlights` is already scoped to this block by the parent, so memoised
     // blocks no longer re-render when an unrelated highlight is added.
@@ -322,60 +391,239 @@ const BlockView = memo(
       }
     };
 
+    const isAudioActive = Boolean(activeSpeechForBlock);
+    const isAudioLoading = isAudioActive && activeSpeechForBlock?.status === "loading";
+    const isAudioPlaying = isAudioActive && activeSpeechForBlock?.status === "playing";
+    const showBlockActions =
+      Boolean(onParagraphAudioClick || onParagraphTranslateClick) && text.trim().length > 0;
+
+    const actionButtons = showBlockActions ? (
+      <span
+        data-reader-toolbar
+        dir="ltr"
+        className="float-end ms-2 mt-0.5 inline-flex items-center gap-0.5 select-none"
+        onClick={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+        onTouchStart={(e) => e.stopPropagation()}
+        onTouchEnd={(e) => e.stopPropagation()}
+      >
+        {onParagraphAudioClick && (
+          <button
+            type="button"
+            aria-label={
+              isAudioPlaying
+                ? "Pause paragraph audio"
+                : isAudioLoading
+                  ? "Loading paragraph audio"
+                  : "Listen to paragraph"
+            }
+            aria-pressed={isAudioPlaying}
+            title={
+              isAudioPlaying
+                ? "Pause audio"
+                : isAudioLoading
+                  ? "Generating audio..."
+                  : "Listen to this paragraph"
+            }
+            onClick={(e) => {
+              e.stopPropagation();
+              onParagraphAudioClick(block.id);
+            }}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:opacity-100"
+            style={{
+              color: isAudioActive ? theme.accent : theme.muted,
+              backgroundColor: isAudioActive ? `${theme.accent}1f` : "transparent",
+              opacity: isAudioActive ? 1 : 0.72,
+            }}
+          >
+            {isAudioLoading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : isAudioPlaying ? (
+              <Pause className="h-3.5 w-3.5" />
+            ) : (
+              <Volume2 className="h-3.5 w-3.5" />
+            )}
+          </button>
+        )}
+
+        {onParagraphTranslateClick && (
+          <button
+            type="button"
+            aria-label={
+              isInlineTranslationVisible
+                ? "Hide paragraph translation"
+                : isInlineTranslating
+                  ? "Translating paragraph"
+                  : "Translate paragraph"
+            }
+            aria-pressed={Boolean(isInlineTranslationVisible)}
+            title={
+              isInlineTranslationVisible
+                ? "Hide translation"
+                : isInlineTranslating
+                  ? "Translating..."
+                  : "Translate this paragraph"
+            }
+            onClick={(e) => {
+              e.stopPropagation();
+              onParagraphTranslateClick(block.id);
+            }}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:opacity-100"
+            style={{
+              color: isInlineTranslationVisible || isInlineTranslating ? theme.accent : theme.muted,
+              backgroundColor:
+                isInlineTranslationVisible || isInlineTranslating ? `${theme.accent}1f` : "transparent",
+              opacity: isInlineTranslationVisible || isInlineTranslating ? 1 : 0.72,
+            }}
+          >
+            {isInlineTranslating ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Languages className="h-3.5 w-3.5" />
+            )}
+          </button>
+        )}
+      </span>
+    ) : null;
+
+    const inlineTranslationCard =
+      (isInlineTranslationVisible && inlineTranslatedText) || inlineTranslateError ? (
+        <div
+          data-inline-translation={block.id}
+          dir={inlineTranslateError ? "ltr" : inlineTranslationMeta?.dir || "ltr"}
+          style={{
+            marginTop: "0.45em",
+            padding: "0.5em 0.75em",
+            borderInlineStart: `3px solid ${inlineTranslateError ? "#dc2626" : theme.accent}`,
+            backgroundColor: inlineTranslateError ? "rgba(220,38,38,0.08)" : `${theme.accent}12`,
+            borderRadius: 6,
+            fontSize: `${Math.max(13, settings.fontSize * 0.92)}px`,
+            lineHeight: settings.lineHeight,
+          }}
+        >
+          <div
+            data-reader-toolbar
+            dir="ltr"
+            className="mb-1 flex items-center justify-between gap-2 text-[11px]"
+            style={{ color: inlineTranslateError ? "#dc2626" : theme.muted }}
+            onClick={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            onTouchEnd={(e) => e.stopPropagation()}
+          >
+            <span
+              className="font-semibold uppercase tracking-wider"
+              style={{ color: inlineTranslateError ? "#dc2626" : theme.accent }}
+            >
+              {inlineTranslateError
+                ? "Translation notice"
+                : `${inlineTranslationMeta?.languageName || "Translated"}${
+                    inlineTranslationMeta?.nativeName
+                      ? ` · ${inlineTranslationMeta.nativeName}`
+                      : ""
+                  }`}
+            </span>
+            {onCloseInlineTranslation && (
+              <button
+                type="button"
+                aria-label="Close paragraph translation"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCloseInlineTranslation(block.id);
+                }}
+                className="rounded p-0.5 opacity-75 hover:opacity-100"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+          <p style={{ margin: 0, overflowWrap: "break-word" }}>
+            {inlineTranslateError ? (
+              inlineTranslateError
+            ) : (
+              <TextContent
+                text={inlineTranslatedText || ""}
+                ranges={inlineSpeechRanges}
+                accentColor={theme.accent}
+              />
+            )}
+          </p>
+        </div>
+      ) : null;
+
     if (block.type === "heading") {
       const scale = block.level === 1 ? 1.5 : block.level === 2 ? 1.28 : 1.12;
       const Tag = `h${Math.min(block.level + 1, 4)}` as "h2" | "h3" | "h4";
       return (
-        <Tag
+        <div
           data-block-id={block.id}
-          dir={block.dir}
-          onDoubleClick={handleDoubleClick}
           style={{
-            fontSize: `${settings.fontSize * scale}px`,
-            lineHeight: 1.3,
-            fontWeight: 700,
             margin: `${settings.fontSize * 1.1}px 0 ${settings.fontSize * 0.45}px`,
-            letterSpacing: "-0.01em",
-            overflowWrap: "break-word",
-            textWrap: "balance",
-          } as React.CSSProperties}
+          }}
         >
-          <TextContent text={text} ranges={ranges} accentColor={theme.accent} />
-        </Tag>
+          {actionButtons}
+          <Tag
+            data-block-text
+            dir={block.dir}
+            onDoubleClick={handleDoubleClick}
+            style={{
+              fontSize: `${settings.fontSize * scale}px`,
+              lineHeight: 1.3,
+              fontWeight: 700,
+              margin: 0,
+              letterSpacing: "-0.01em",
+              overflowWrap: "break-word",
+              textWrap: "balance",
+            } as React.CSSProperties}
+          >
+            <TextContent text={text} ranges={ranges} accentColor={theme.accent} />
+          </Tag>
+          <span aria-hidden className="block clear-both" />
+          {inlineTranslationCard}
+        </div>
       );
     }
 
     return (
-      <p
+      <div
         data-block-id={block.id}
-        dir={block.dir}
-        onDoubleClick={handleDoubleClick}
         style={{
-          fontSize: `${settings.fontSize * (block.small ? 0.85 : 1)}px`,
-          lineHeight: settings.lineHeight,
           margin: `0 0 ${settings.fontSize * settings.paragraphSpacing}px`,
-          textIndent: settings.firstLineIndent && block.indent && !block.quote ? "1.35em" : undefined,
-          textAlign: settings.justify && !block.quote ? "justify" : "start",
-          hyphens: settings.justify ? "auto" : undefined,
-          WebkitHyphens: settings.justify ? "auto" : undefined,
-          letterSpacing: settings.looseSpacing ? "0.02em" : undefined,
-          wordSpacing: settings.looseSpacing ? "0.1em" : undefined,
-          paddingInlineStart: block.quote ? "1em" : undefined,
-          borderInlineStart: block.quote ? `3px solid ${theme.muted}66` : undefined,
-          fontStyle: block.quote ? "italic" : undefined,
-          color: block.small ? theme.muted : undefined,
-          overflowWrap: "break-word",
-          textWrap: settings.justify ? undefined : "pretty",
-          orphans: 2,
-          widows: 2,
-          fontKerning: "normal",
-          fontVariantLigatures: "common-ligatures",
-          textRendering: "optimizeLegibility",
-          WebkitFontSmoothing: "antialiased",
-        } as React.CSSProperties}
+        }}
       >
-        <TextContent text={text} ranges={ranges} accentColor={theme.accent} />
-      </p>
+        {actionButtons}
+        <p
+          data-block-text
+          dir={block.dir}
+          onDoubleClick={handleDoubleClick}
+          style={{
+            fontSize: `${settings.fontSize * (block.small ? 0.85 : 1)}px`,
+            lineHeight: settings.lineHeight,
+            margin: 0,
+            textIndent: settings.firstLineIndent && block.indent && !block.quote ? "1.35em" : undefined,
+            textAlign: settings.justify && !block.quote ? "justify" : "start",
+            hyphens: settings.justify ? "auto" : undefined,
+            WebkitHyphens: settings.justify ? "auto" : undefined,
+            letterSpacing: settings.looseSpacing ? "0.02em" : undefined,
+            wordSpacing: settings.looseSpacing ? "0.1em" : undefined,
+            paddingInlineStart: block.quote ? "1em" : undefined,
+            borderInlineStart: block.quote ? `3px solid ${theme.muted}66` : undefined,
+            fontStyle: block.quote ? "italic" : undefined,
+            color: block.small ? theme.muted : undefined,
+            overflowWrap: "break-word",
+            textWrap: settings.justify ? undefined : "pretty",
+            orphans: 2,
+            widows: 2,
+            fontKerning: "normal",
+            fontVariantLigatures: "common-ligatures",
+            textRendering: "optimizeLegibility",
+            WebkitFontSmoothing: "antialiased",
+          } as React.CSSProperties}
+        >
+          <TextContent text={text} ranges={ranges} accentColor={theme.accent} />
+        </p>
+        <span aria-hidden className="block clear-both" />
+        {inlineTranslationCard}
+      </div>
     );
   }
 );
@@ -516,16 +764,36 @@ const BlockSlot = memo(
     settings,
     highlights,
     searchQuery,
-    activeSentenceIndex,
+    activeSpeechForBlock,
     onSentenceDoubleClick,
+    onParagraphAudioClick,
+    onParagraphTranslateClick,
+    onCloseInlineTranslation,
+    inlineTranslatedText,
+    isInlineTranslationVisible,
+    isInlineTranslating,
+    inlineTranslateError,
+    inlineTranslationMeta,
     virtualize,
   }: {
     block: Block;
     settings: ReaderSettings;
     highlights: Highlight[];
     searchQuery?: string;
-    activeSentenceIndex?: number | null;
+    activeSpeechForBlock?: ActiveSpeechInfo | null;
     onSentenceDoubleClick?: (blockId: string, sentenceIndex: number) => void;
+    onParagraphAudioClick?: (blockId: string) => void;
+    onParagraphTranslateClick?: (blockId: string) => void;
+    onCloseInlineTranslation?: (blockId: string) => void;
+    inlineTranslatedText?: string;
+    isInlineTranslationVisible?: boolean;
+    isInlineTranslating?: boolean;
+    inlineTranslateError?: string;
+    inlineTranslationMeta?: {
+      languageName: string;
+      nativeName: string;
+      dir: "ltr" | "rtl";
+    };
     virtualize: boolean;
   }) => {
     if (block.type === "image" && block.fullPage) {
@@ -537,8 +805,16 @@ const BlockSlot = memo(
         settings={settings}
         highlights={highlights}
         searchQuery={searchQuery}
-        activeSentenceIndex={activeSentenceIndex}
+        activeSpeechForBlock={activeSpeechForBlock}
         onSentenceDoubleClick={onSentenceDoubleClick}
+        onParagraphAudioClick={onParagraphAudioClick}
+        onParagraphTranslateClick={onParagraphTranslateClick}
+        onCloseInlineTranslation={onCloseInlineTranslation}
+        inlineTranslatedText={inlineTranslatedText}
+        isInlineTranslationVisible={isInlineTranslationVisible}
+        isInlineTranslating={isInlineTranslating}
+        inlineTranslateError={inlineTranslateError}
+        inlineTranslationMeta={inlineTranslationMeta}
       />
     );
     if (!virtualize) return body;
@@ -565,6 +841,14 @@ const PaginatedReader = ({
   navRequest,
   activeSpeech,
   onSentenceClick,
+  onParagraphAudioClick,
+  onParagraphTranslateClick,
+  onCloseInlineTranslation,
+  inlineTranslations,
+  inlineTranslationVisible,
+  inlineTranslatingIds,
+  inlineTranslateErrors,
+  inlineTranslationMeta,
   coverUrl,
   title,
   author,
@@ -998,12 +1282,17 @@ const PaginatedReader = ({
         setSelection(null);
         return;
       }
+      const textRoot = (startEl.querySelector("[data-block-text]") as HTMLElement | null) ?? startEl;
+      if (!textRoot.contains(range.startContainer)) {
+        setSelection(null);
+        return;
+      }
       const text = sel.toString().trim();
       if (text.length < 2) {
         setSelection(null);
         return;
       }
-      const start = offsetWithin(startEl, range.startContainer, range.startOffset);
+      const start = offsetWithin(textRoot, range.startContainer, range.startOffset);
       const rect = range.getBoundingClientRect();
       const containerRect = container.getBoundingClientRect();
       setSelection({
@@ -1096,10 +1385,18 @@ const PaginatedReader = ({
           settings={settings}
           highlights={highlightsByBlock.get(block.id) ?? EMPTY_HIGHLIGHTS}
           searchQuery={searchQuery}
-          activeSentenceIndex={
-            activeSpeech?.blockId === block.id ? activeSpeech.sentenceIndex : null
+          activeSpeechForBlock={
+            activeSpeech?.blockId === block.id ? activeSpeech : null
           }
           onSentenceDoubleClick={onSentenceClick}
+          onParagraphAudioClick={onParagraphAudioClick}
+          onParagraphTranslateClick={onParagraphTranslateClick}
+          onCloseInlineTranslation={onCloseInlineTranslation}
+          inlineTranslatedText={inlineTranslations?.[block.id]}
+          isInlineTranslationVisible={Boolean(inlineTranslationVisible?.[block.id])}
+          isInlineTranslating={Boolean(inlineTranslatingIds?.[block.id])}
+          inlineTranslateError={inlineTranslateErrors?.[block.id]}
+          inlineTranslationMeta={inlineTranslationMeta}
           virtualize={virtualize}
         />
       ))}
@@ -1244,10 +1541,20 @@ const PaginatedReader = ({
         ["--reader-vh" as string]: `${Math.max(viewportHeight, 200)}px`,
       } as React.CSSProperties}
       onTouchStart={(e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest("[data-reader-toolbar]")) {
+          touchRef.current = null;
+          return;
+        }
         const t = e.touches[0];
         touchRef.current = { x: t.clientX, y: t.clientY, time: Date.now() };
       }}
       onTouchEnd={(e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest("[data-reader-toolbar]")) {
+          touchRef.current = null;
+          return;
+        }
         const start = touchRef.current;
         touchRef.current = null;
         lastTouchRef.current = Date.now();

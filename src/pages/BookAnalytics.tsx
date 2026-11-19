@@ -46,6 +46,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { useBookAnalytics } from "@/hooks/useBookAnalytics";
 import { formatReadingDuration } from "@/lib/analytics/aggregation";
 import type { AnalyticsTimeRangePreset, PeriodDeltaMetric } from "@/lib/analytics/types";
+import { useSmartBack } from "@/lib/navigation";
 
 const PRESET_OPTIONS: { value: AnalyticsTimeRangePreset; label: string }[] = [
   { value: "today", label: "Today" },
@@ -92,6 +93,7 @@ const tooltipStyle = {
 const BookAnalytics = () => {
   const { bookId } = useParams();
   const navigate = useNavigate();
+  const handleBack = useSmartBack(bookId ? `/bookshelf/book/${bookId}` : "/bookshelf");
   const { user } = useAuth();
 
   const [preset, setPreset] = useState<AnalyticsTimeRangePreset>("all");
@@ -169,8 +171,8 @@ const BookAnalytics = () => {
             <Button
               variant="ghost"
               size="icon"
-              aria-label="Back to book"
-              onClick={() => navigate(`/bookshelf/book/${book.id}`)}
+              aria-label="Back"
+              onClick={() => handleBack()}
             >
               <ArrowLeft className="w-5 h-5" />
             </Button>

@@ -13,10 +13,13 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { ArrowLeft, Camera, Loader2, Save, Upload } from "lucide-react";
 import { toast } from "sonner";
+import { useSmartBack } from "@/lib/navigation";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 const EditAuthorChannel = () => {
     const { channelId } = useParams();
     const navigate = useNavigate();
+    const handleBack = useSmartBack(channelId ? `/bookshelf/channel/${channelId}` : "/bookshelf");
     const { user } = useAuth();
     const updateChannel = useUpdateChannel();
     const queryClient = useQueryClient();
@@ -43,7 +46,10 @@ const EditAuthorChannel = () => {
                 .eq("id", channelId)
                 .single();
 
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return null;
+                throw error;
+            }
             return data;
         },
         enabled: !!channelId,
@@ -146,7 +152,7 @@ const EditAuthorChannel = () => {
     return (
         <div className="min-h-screen bg-background pb-20">
             <header className="sticky top-0 z-40 bg-card/80 backdrop-blur-lg border-b px-4 py-3 flex items-center gap-4">
-                <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+                <Button variant="ghost" size="icon" aria-label="Back" onClick={() => handleBack()}>
                     <ArrowLeft className="w-5 h-5" />
                 </Button>
                 <h1 className="font-semibold text-lg">Edit Channel</h1>

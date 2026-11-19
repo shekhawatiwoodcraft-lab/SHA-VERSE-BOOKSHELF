@@ -6,10 +6,12 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useAuth } from "@/contexts/AuthContext";
 import { useChannelAnalytics } from "@/hooks/useChannelAnalytics";
 import { ChannelAnalyticsPanel } from "@/components/bookshelf/analytics/ChannelAnalyticsPanel";
+import { useSmartBack } from "@/lib/navigation";
 
 const ChannelAnalytics = () => {
   const { channelId } = useParams();
   const navigate = useNavigate();
+  const handleBack = useSmartBack(channelId ? `/bookshelf/channel/${channelId}` : "/bookshelf");
   const { user } = useAuth();
   const { channel, isLoading } = useChannelAnalytics({
     channelId,
@@ -48,8 +50,8 @@ const ChannelAnalytics = () => {
             <Button
               variant="ghost"
               size="icon"
-              aria-label="Back to channel"
-              onClick={() => navigate(`/bookshelf/channel/${channelId}`)}
+              aria-label="Back"
+              onClick={() => handleBack()}
             >
               <ArrowLeft className="w-5 h-5" />
             </Button>

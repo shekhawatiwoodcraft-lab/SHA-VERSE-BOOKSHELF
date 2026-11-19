@@ -4,6 +4,7 @@ import {
   detectDialogueParts,
   extractCandidateGlossaryTerms,
   hashTextContent,
+  parseModelJson,
   resolveBookChapters,
   splitIntoSentences,
   validateTranslationBatch,
@@ -102,6 +103,35 @@ describe("Chapter resolution, audio alignment & translation validation", () => {
     expect(segments[1].text).toBe("आरव सूर्योदय के समय काशी पहुँचा।");
     expect(segments[2].text).toBe("पक्षियों ने गीत गाया।");
     expect(hashTextContent("abc")).toBe(hashTextContent("abc"));
+  });
+
+  it("coalesces each paragraph into a single segment in paragraph mode and splits huge blocks safely", () => {
+    const segs = buildChapterAudioSegments({
+      bookId: "b1",
+      chapter: sampleBook.chapters[0],
+      blocks: sampleBook.blocks,
+      startIndex: 0,
+      endIndex: sampleBook.blocks.length,
+      language: "en",
+      voiceId: "Kore",
+      style: "natural",
+      mode: "paragraph",
+      maxCharsPerSegment: 32,
+    });
+    expect(segs[0].text).toBe("Chapter One");
+    expect(segs[0].sentenceIndex).toBe(0);
+    // b1 splits into two sentence-aligned chunks under maxCharsPerSegment=32
+    const b1Segs = segs.filter((s) => s.blockId === "b1");
+    expect(b1Segs).toHaveLength(2);
+    expect(b1Segs[0].sentenceIndex).toBe(0);
+    expect(b1Segs[1].sentenceIndex).toBe(1);
+    expect(b1Segs[0].charStart).toBe(0);
+    expect(b1Segs[1].charEnd).toBe(sampleBook.blocks[1].text.length);
+  });
+
+  it("parses JSON wrapped in markdown code fences via parseModelJson", () => {
+    const parsed = parseModelJson<{ ok: boolean }>('```json\n{"ok": true}\n```');
+    expect(parsed.ok).toBe(true);
   });
 
   it("synthesizes fallback chapters when PDF outline is empty", () => {

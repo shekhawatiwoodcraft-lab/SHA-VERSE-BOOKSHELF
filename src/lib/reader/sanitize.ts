@@ -59,20 +59,40 @@ export function normalizeReaderText(input: string): string {
 }
 
 /**
+ * Detect mathematical expressions/equations so symbol-dense math content is never
+ * misclassified as PDF metadata or noise.
+ */
+export function hasMathEquationSyntax(rawText: string): boolean {
+  const text = rawText.trim();
+  if (!text) return false;
+  if (/[≈≠≤≥∑∫∏√±×÷∂∇∞∈∉⊂⊆∪∩∀∃⇒⇔]/.test(text)) return true;
+
+  // Reject OCR glyph soup dense with pipes/backslashes/semicolon noise before matching ASCII operators.
+  const ocrNoiseCount = text.match(/[|\\;]/g)?.length ?? 0;
+  if (ocrNoiseCount >= 2 || text.length > 160) return false;
+
+  const hasMathFunc = /\b(?:sin|cos|tan|cot|sec|csc|log|ln|exp|lim|max|min|sqrt|det)\s*\(/i.test(text);
+  if (hasMathFunc) return true;
+
+  const hasEqualsWithMath =
+    /(?:^|\s)[A-Za-z0-9()_\^]+\s*=\s*[A-Za-z0-9()+\-*/^_.\s]+$/.test(text) &&
+    (/[+\-*/^_\d()]/.test(text) || /^[A-Za-z0-9]+\s*=\s*[A-Za-z0-9]+$/.test(text));
+  const hasAlgebraic = /(?:[A-Za-z0-9)\]}]\s*[+\-*/^]\s*[A-Za-z0-9(\[{])/.test(text) && /[\d^_=]/.test(text);
+  return hasEqualsWithMath || hasAlgebraic;
+}
+
+/**
  * Repair small-caps titles that PDFs emit as separated glyphs
- * (`F OREWORD`, `K YLE W ILLIAM B ISHOP`) so they read as real words.
- * Applied only to fully upper-case lines, so normal prose like
- * "A NASA report" is never touched.
+ * (`F OREWORD`, `J ERROLD`, `C ONGRESS`) so they read as real words.
+ * Applied only to fully upper-case lines, and preserves real initials (`U S ARMY`,
+ * `A JOURNEY`, `I AM`).
  */
 export function repairSmallCaps(line: string): string {
   const text = line.trim();
   if (!text || text.length > 140) return line;
   if (/[a-z]/.test(text)) return line;
-  // Split-glyph small-caps pattern: a single non-word letter followed by a
-  // spaced capital cluster ("F OREWORD"). "A"/"I" are real one-letter words
-  // ("A JOURNEY HOME", "I AM LEGEND") and must never be glued to the next word.
-  if (!/\b[B-HJ-Z]\s+[A-Z]{2,}/.test(text)) return line;
-  return text.replace(/\b([B-HJ-Z])\s+([A-Z]{2,})/g, "$1$2");
+  if (!/(?<!\b[B-HJ-Z]\s)\b[B-HJ-Z]\s+[A-Z]{2,}/.test(text)) return line;
+  return text.replace(/(?<!\b[B-HJ-Z]\s)\b([B-HJ-Z])\s+([A-Z]{2,})/g, "$1$2");
 }
 
 const METADATA_PATTERNS: RegExp[] = [
@@ -96,10 +116,13 @@ export function isHiddenMetadata(rawText: string): boolean {
   if (!text) return true;
   if (METADATA_PATTERNS.some((re) => re.test(text))) return true;
 
+  // Never discard genuine mathematical formulas or expressions.
+  if (hasMathEquationSyntax(text)) return false;
+
   // Long unbroken token soup (hex/base64 stream residue) with no spaces.
   if (text.length > 40 && !/\s/.test(text) && /^[A-Za-z0-9+/=<>]+$/.test(text)) return true;
 
-  // Mostly-symbol noise with almost no letters in any script.
+  // Mostly-symbol noise with almost no letters or digits in any script.
   const letters = text.match(/[\p{L}\p{N}]/gu)?.length ?? 0;
   if (text.length > 12 && letters / text.length < 0.25) return true;
 

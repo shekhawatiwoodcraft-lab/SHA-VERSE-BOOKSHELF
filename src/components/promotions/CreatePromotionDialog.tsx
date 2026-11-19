@@ -1,4 +1,5 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useCallback } from 'react';
+import { useRegisterBackOverlay } from '@/lib/navigation';
 import {
   Sheet,
   SheetContent,
@@ -97,9 +98,11 @@ export default function CreatePromotionDialog({ open, onOpenChange }: CreateProm
     });
   };
 
-  const resetAndClose = () => {
-    selectedFiles.forEach((item) => URL.revokeObjectURL(item.previewUrl));
-    setSelectedFiles([]);
+  const resetAndClose = useCallback(() => {
+    setSelectedFiles((prev) => {
+      prev.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      return [];
+    });
     setTextContent('');
     setCaption('');
     setLinkUrl('');
@@ -109,7 +112,17 @@ export default function CreatePromotionDialog({ open, onOpenChange }: CreateProm
     setStep('duration');
     setMode('media');
     onOpenChange(false);
-  };
+  }, [onOpenChange]);
+
+  const handleOverlayBack = useCallback(() => {
+    if (step === 'content') {
+      setStep('duration');
+    } else {
+      resetAndClose();
+    }
+  }, [step, resetAndClose]);
+
+  useRegisterBackOverlay(open, 'create-promotion-dialog', handleOverlayBack);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

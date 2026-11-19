@@ -19,7 +19,7 @@ interface ReauthenticationEmailProps {
   siteName?: string
 }
 
-const LOGO_URL = 'https://plmhjuqedtkiffzhberf.supabase.co/storage/v1/object/public/email-assets/sha-verse-logo.jpeg'
+const LOGO_URL = 'https://www.sha-verse.com/sha-verse-logo.jpeg'
 
 export const ReauthenticationEmail = ({ token, siteName = 'Sha-Verse' }: ReauthenticationEmailProps) => (
   <Html lang="en" dir="ltr">

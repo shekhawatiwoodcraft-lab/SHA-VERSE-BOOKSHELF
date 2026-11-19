@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
+import { useRegisterBackOverlay } from '@/lib/navigation';
 import {
   Sheet,
   SheetContent,
@@ -38,6 +39,8 @@ interface PromoteWithUsSheetProps {
 }
 
 export default function PromoteWithUsSheet({ open, onOpenChange }: PromoteWithUsSheetProps) {
+  const handleClose = useCallback(() => onOpenChange(false), [onOpenChange]);
+  useRegisterBackOverlay(open, 'promote-with-us-sheet', handleClose);
   const [region, setRegion] = useState<PricingRegion>('INTL');
   const [selectedHours, setSelectedHours] = useState<number | undefined>(undefined);
   const [copied, setCopied] = useState(false);

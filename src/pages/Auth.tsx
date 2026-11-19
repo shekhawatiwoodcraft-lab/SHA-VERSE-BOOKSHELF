@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { supabase } from "@/integrations/supabase/client";
-import { lovable } from "@/integrations/lovable";
+import { supabase, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -118,12 +117,13 @@ const Auth = () => {
         toast({ title: "Account created!", description: "Please check your email to verify your account" });
         navigate("/");
       }
-    } catch (error: any) {
+    } catch (error: unknown) {
       await logAttempt(email, "email", false);
       if (error instanceof z.ZodError) {
         toast({ title: "Validation Error", description: error.errors[0].message, variant: "destructive" });
       } else {
-        toast({ title: "Error", description: error.message || "An error occurred", variant: "destructive" });
+        const msg = error instanceof Error ? error.message : String(error || "An error occurred");
+        toast({ title: "Error", description: msg, variant: "destructive" });
       }
     } finally {
       setLoading(false);
@@ -142,10 +142,11 @@ const Auth = () => {
           toast({ title: "Welcome back!", description: "Successfully logged in with Google" });
           navigate("/");
           return;
-        } catch (nativeError: any) {
-          const msg = String(nativeError?.message ?? nativeError ?? "");
+        } catch (nativeError: unknown) {
+          const errObj = nativeError as { code?: string; message?: string } | undefined;
+          const msg = String(errObj?.message ?? nativeError ?? "");
           const pluginMissing =
-            nativeError?.code === "UNIMPLEMENTED" ||
+            errObj?.code === "UNIMPLEMENTED" ||
             /not implemented|unimplemented|not available|not registered/i.test(msg);
           // Plugin missing in this build → fall through to the managed web OAuth
           // flow instead of dead-ending the user.
@@ -162,21 +163,50 @@ const Auth = () => {
         }
       }
 
-      // Web: Lovable managed OAuth (unchanged).
-      const result = await lovable.auth.signInWithOAuth("google", {
-        redirect_uri: window.location.origin,
-        extraParams: {
-          prompt: "select_account",
+      // Preflight check whether Google provider is enabled on the connected Supabase project
+      // so users never get redirected to a raw JSON 400 page when provider is still off.
+      if (SUPABASE_URL && SUPABASE_PUBLISHABLE_KEY) {
+        try {
+          const settingsRes = await fetch(`${SUPABASE_URL}/auth/v1/settings`, {
+            headers: { apikey: SUPABASE_PUBLISHABLE_KEY },
+          });
+          if (settingsRes.ok) {
+            const settings = (await settingsRes.json()) as { external?: { google?: boolean } };
+            if (settings?.external?.google === false) {
+              toast({
+                title: "Google Sign-In Not Enabled Yet",
+                description:
+                  "Supabase Dashboard → Authentication → Providers → Google enable karein, ya abhi Email se Sign In/Sign Up karein.",
+                variant: "destructive",
+              });
+              setLoading(false);
+              return;
+            }
+          }
+        } catch {
+          // Ignore network preflight errors and fall through to standard OAuth flow
+        }
+      }
+
+      // Web: Standard Supabase OAuth against the connected Supabase project.
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo: `${window.location.origin}/`,
+          queryParams: {
+            prompt: "select_account",
+          },
         },
       });
 
-      if (result.error) throw result.error;
-      if (result.redirected) return;
-
-      toast({ title: "Welcome back!", description: "Successfully logged in with Google" });
-      navigate("/");
-    } catch (error: any) {
-      toast({ title: "Error", description: error.message || "Failed to sign in with Google", variant: "destructive" });
+      if (error) throw error;
+    } catch (error: unknown) {
+      const errObj = error as { message?: string } | undefined;
+      const rawMessage = String(errObj?.message || (error instanceof Error ? error.message : "") || "Failed to sign in with Google");
+      const friendlyMessage = /unsupported provider|provider is not enabled/i.test(rawMessage)
+        ? "Google login is not enabled yet in Supabase (Authentication → Providers → Google). Use Email login or enable Google in Supabase Dashboard."
+        : rawMessage;
+      toast({ title: "Google Sign-In", description: friendlyMessage, variant: "destructive" });
       setLoading(false);
     }
   };
@@ -201,12 +231,13 @@ const Auth = () => {
       setAuthMethod("otp-verify");
       setCountdown(60); // 60 seconds cooldown
       toast({ title: "OTP Sent!", description: "Check your phone for the verification code" });
-    } catch (error: any) {
+    } catch (error: unknown) {
       await logAttempt(phone, "phone", false);
       if (error instanceof z.ZodError) {
         toast({ title: "Validation Error", description: error.errors[0].message, variant: "destructive" });
       } else {
-        toast({ title: "Error", description: error.message || "Failed to send OTP", variant: "destructive" });
+        const msg = error instanceof Error ? error.message : String(error || "Failed to send OTP");
+        toast({ title: "Error", description: msg, variant: "destructive" });
       }
     } finally {
       setLoading(false);
@@ -236,9 +267,10 @@ const Auth = () => {
       await logAttempt(phone, "phone", true);
       toast({ title: "Success!", description: "Phone number verified successfully" });
       navigate("/");
-    } catch (error: any) {
+    } catch (error: unknown) {
       await logAttempt(phone, "phone", false);
-      toast({ title: "Error", description: error.message || "Invalid OTP", variant: "destructive" });
+      const msg = error instanceof Error ? error.message : String(error || "Invalid OTP");
+      toast({ title: "Error", description: msg, variant: "destructive" });
     } finally {
       setLoading(false);
     }

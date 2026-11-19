@@ -9,11 +9,20 @@ import {
   type ReaderSettings,
 } from "@/lib/reader/settings";
 
+export interface EpubInlineTranslationResult {
+  translatedText: string;
+  languageName: string;
+  nativeName: string;
+  dir: "ltr" | "rtl";
+}
+
 interface EPUBViewerProps {
   url: string;
   initialCfi?: string;
   onLocationChange?: (cfi: string, page: number, totalPages: number, href?: string) => void;
   onTocExtracted?: (toc: TocItem[]) => void;
+  onParagraphAudio?: (paragraphText: string) => void;
+  onParagraphTranslate?: (paragraphText: string) => Promise<EpubInlineTranslationResult>;
   onTap?: () => void;
   settings?: ReaderSettings;
   theme?: "light" | "dark" | "sepia";
@@ -60,6 +69,8 @@ const EPUBViewer = ({
   initialCfi,
   onLocationChange,
   onTocExtracted,
+  onParagraphAudio,
+  onParagraphTranslate,
   onTap,
   settings,
   theme = "light",
@@ -77,6 +88,10 @@ const EPUBViewer = ({
   const renditionRef = useRef<Rendition | null>(null);
   const onTapRef = useRef(onTap);
   onTapRef.current = onTap;
+  const onParagraphAudioRef = useRef(onParagraphAudio);
+  onParagraphAudioRef.current = onParagraphAudio;
+  const onParagraphTranslateRef = useRef(onParagraphTranslate);
+  onParagraphTranslateRef.current = onParagraphTranslate;
   const settingsRef = useRef(effectiveSettings);
   settingsRef.current = effectiveSettings;
 
@@ -124,15 +139,136 @@ const EPUBViewer = ({
         rendition.themes.select("shaverse-active");
         rendition.themes.fontSize(`${currentSettings.fontSize}px`);
 
-        // Attach swipe, tap-zone, and keyboard inside EPUB iframe contents
+        // Attach swipe, tap-zone, and per-paragraph Audio/Translate actions inside EPUB iframe
         rendition.hooks.content.register((contents: any) => {
           const doc = contents?.document as Document | undefined;
           if (!doc) return;
+
+          if (onParagraphAudioRef.current || onParagraphTranslateRef.current) {
+            const palette = READER_THEMES[settingsRef.current.theme] ?? READER_THEMES.light;
+            const blocks = doc.querySelectorAll("p, h1, h2, h3, h4");
+            blocks.forEach((node) => {
+              const el = node as HTMLElement;
+              if (el.closest("[data-sv-inline-tr], nav")) return;
+              if (el.querySelector("[data-sv-para-actions]")) return;
+              const rawText = (el.textContent || "").replace(/\s+/g, " ").trim();
+              if (rawText.length < 2) return;
+
+              const bar = doc.createElement("span");
+              bar.setAttribute("data-sv-para-actions", "true");
+              bar.setAttribute("dir", "ltr");
+              bar.style.cssText =
+                "float:right;margin-left:8px;display:inline-flex;align-items:center;gap:2px;user-select:none;line-height:1;";
+
+              const stopBubble = (ev: Event) => {
+                ev.stopPropagation();
+              };
+              bar.addEventListener("touchstart", stopBubble, { passive: true });
+              bar.addEventListener("touchend", stopBubble, { passive: true });
+              bar.addEventListener("pointerdown", stopBubble);
+              bar.addEventListener("click", stopBubble);
+
+              const createBtn = (label: string, svgMarkup: string) => {
+                const btn = doc.createElement("button");
+                btn.type = "button";
+                btn.setAttribute("aria-label", label);
+                btn.title = label;
+                btn.style.cssText = `background:transparent;border:none;padding:3px;cursor:pointer;color:${palette.muted};opacity:0.75;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;`;
+                btn.innerHTML = svgMarkup;
+                return btn;
+              };
+
+              if (onParagraphAudioRef.current) {
+                const audioBtn = createBtn(
+                  "Listen to paragraph",
+                  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>',
+                );
+                audioBtn.addEventListener("click", (ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  onParagraphAudioRef.current?.(rawText);
+                });
+                bar.appendChild(audioBtn);
+              }
+
+              if (onParagraphTranslateRef.current) {
+                const trBtn = createBtn(
+                  "Translate paragraph",
+                  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"></path><path d="m4 14 6-6 2-3"></path><path d="M2 5h12"></path><path d="M7 2h1"></path><path d="m22 22-5-10-5 10"></path><path d="M14 18h6"></path></svg>',
+                );
+                trBtn.addEventListener("click", async (ev) => {
+                  ev.preventDefault();
+                  ev.stopPropagation();
+                  const existing =
+                    el.nextElementSibling?.getAttribute("data-sv-inline-tr") === "true"
+                      ? (el.nextElementSibling as HTMLElement)
+                      : null;
+                  if (existing && existing.getAttribute("data-sv-state") === "done") {
+                    const isHidden = existing.style.display === "none";
+                    existing.style.display = isHidden ? "block" : "none";
+                    return;
+                  }
+                  const card = existing ?? doc.createElement("div");
+                  card.setAttribute("data-sv-inline-tr", "true");
+                  card.setAttribute("data-sv-state", "loading");
+                  card.style.cssText = `margin:6px 0 12px;padding:8px 12px;border-left:3px solid ${palette.accent};background:${palette.accent}14;border-radius:6px;font-size:0.9em;line-height:1.5;display:block;`;
+                  card.textContent = "Translating...";
+                  if (!existing) {
+                    el.insertAdjacentElement("afterend", card);
+                  }
+
+                  try {
+                    const res = await onParagraphTranslateRef.current?.(rawText);
+                    if (!res) {
+                      card.textContent = "Translation unavailable.";
+                      card.setAttribute("data-sv-state", "error");
+                      return;
+                    }
+                    card.setAttribute("data-sv-state", "done");
+                    card.setAttribute("dir", res.dir);
+                    card.textContent = "";
+
+                    const header = doc.createElement("div");
+                    header.setAttribute("dir", "ltr");
+                    header.style.cssText = `display:flex;justify-content:space-between;align-items:center;font-size:0.75em;font-weight:600;color:${palette.accent};margin-bottom:4px;`;
+                    const titleSpan = doc.createElement("span");
+                    titleSpan.textContent = `${res.languageName} · ${res.nativeName}`;
+                    const closeBtn = doc.createElement("button");
+                    closeBtn.type = "button";
+                    closeBtn.textContent = "×";
+                    closeBtn.setAttribute("aria-label", "Close paragraph translation");
+                    closeBtn.style.cssText = `border:none;background:transparent;color:${palette.muted};cursor:pointer;font-size:14px;line-height:1;padding:0 4px;`;
+                    closeBtn.addEventListener("click", (ce) => {
+                      ce.preventDefault();
+                      ce.stopPropagation();
+                      card.style.display = "none";
+                    });
+                    header.appendChild(titleSpan);
+                    header.appendChild(closeBtn);
+
+                    const bodyP = doc.createElement("div");
+                    bodyP.textContent = res.translatedText;
+                    card.appendChild(header);
+                    card.appendChild(bodyP);
+                  } catch (err) {
+                    card.setAttribute("data-sv-state", "error");
+                    card.textContent =
+                      err instanceof Error ? err.message : "Could not translate paragraph.";
+                  }
+                });
+                bar.appendChild(trBtn);
+              }
+
+              el.insertBefore(bar, el.firstChild);
+            });
+          }
 
           let touchStart: { x: number; y: number; time: number } | null = null;
           doc.addEventListener(
             "touchstart",
             (e: TouchEvent) => {
+              const target = e.target as HTMLElement | null;
+              if (target?.closest("[data-sv-para-actions], [data-sv-inline-tr]")) return;
               const t = e.touches[0];
               if (t) touchStart = { x: t.clientX, y: t.clientY, time: Date.now() };
             },
@@ -141,6 +277,11 @@ const EPUBViewer = ({
           doc.addEventListener(
             "touchend",
             (e: TouchEvent) => {
+              const target = e.target as HTMLElement | null;
+              if (target?.closest("[data-sv-para-actions], [data-sv-inline-tr]")) {
+                touchStart = null;
+                return;
+              }
               const start = touchStart;
               touchStart = null;
               if (!start) return;
@@ -173,7 +314,7 @@ const EPUBViewer = ({
 
           doc.addEventListener("click", (e: MouseEvent) => {
             const target = e.target as HTMLElement | null;
-            if (target?.closest("a")) return;
+            if (target?.closest("a, [data-sv-para-actions], [data-sv-inline-tr]")) return;
             const sel = doc.getSelection()?.toString().trim();
             if (sel) return;
             const width = Math.max(doc.documentElement.clientWidth || window.innerWidth, 1);

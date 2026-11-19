@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 export interface BookComment {
   id: string;
@@ -40,7 +41,10 @@ export const useBookComments = (bookId?: string) => {
         .is("parent_id", null) // Only top-level comments
         .order("created_at", { ascending: false });
 
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return [];
+        throw error;
+      }
 
       // Count replies for each comment
       return (data as any[]).map(comment => ({

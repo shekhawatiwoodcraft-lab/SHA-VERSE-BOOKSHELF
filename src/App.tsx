@@ -15,6 +15,7 @@ import { AdProvider } from "./contexts/AdContext";
 import { AudiobookProvider } from "./contexts/AudiobookContext";
 import MiniAudioPlayer from "./components/bookshelf/reader/MiniAudioPlayer";
 import { useIsMobile } from "./hooks/use-mobile";
+import { shouldRetryQuery } from "./integrations/supabase/config";
 
 // Wrap React.lazy to auto-recover from stale chunk errors after a new deploy.
 const lazy = <T extends ComponentType<any>>(factory: () => Promise<{ default: T }>) =>
@@ -56,7 +57,7 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 1000 * 60 * 5,
       gcTime: 1000 * 60 * 30,
-      retry: 2,
+      retry: shouldRetryQuery,
       refetchOnWindowFocus: false,
     },
   },

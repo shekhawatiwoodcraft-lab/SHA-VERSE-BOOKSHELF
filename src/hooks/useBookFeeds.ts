@@ -5,6 +5,7 @@ import { Book } from "@/hooks/useBooks";
 import { useEffect, useCallback, useMemo } from "react";
 import { BOOK_PUBLIC_COLUMNS, HIDE_SEED_BOOKS, SEED_BOOK_URL } from "@/lib/constants/bookshelf";
 import { excludeSeedBooks, filterSeedBooks } from "@/modules/bookshelf/lib/seedFilter";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 /**
  * Returns the set of "seed-only" author channel IDs — channels whose books are
@@ -113,7 +114,10 @@ export const useBookFeed = (options: {
             query = query.range(page * limit, (page + 1) * limit - 1);
 
             const { data, error } = await query;
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return [];
+                throw error;
+            }
             return sortDiscoverBooks((data || []) as Book[]);
         },
         placeholderData: (previousData) => previousData,
@@ -155,7 +159,10 @@ export const useTrendingBooks = (category: string = "All") => {
             }
 
             const { data, error } = await query;
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return [];
+                throw error;
+            }
             const candidateBooks = (data || []) as Book[];
             if (candidateBooks.length === 0) return [];
 
@@ -268,7 +275,10 @@ export const useSubscribedBooks = (options: {
 
             const { data: books, error } = await query;
 
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return [];
+                throw error;
+            }
             return (books || []) as Book[];
         },
         enabled: !!user?.id,
@@ -324,7 +334,10 @@ export const useSavedBooks = (options: { search?: string; category?: string; pag
 
             const { data, error } = await query;
 
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return [];
+                throw error;
+            }
             const savedBooks = data?.map(d => d.book).filter(Boolean) as Book[] || [];
             // Hide demo/seed books (non-destructive, reversible)
             return filterSeedBooks(savedBooks);
@@ -370,7 +383,10 @@ export const useBook = (bookId?: string) => {
                 .eq("id", bookId)
                 .single();
 
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return null;
+                throw error;
+            }
             return data;
         },
         enabled: !!bookId,
@@ -452,7 +468,10 @@ export const useSubscribedBookChannels = () => {
                 .eq("user_id", user.id)
                 .eq("channels.channel_type", "books");
 
-            if (error) throw error;
+            if (error) {
+                if (isSchemaMissingError(error)) return [];
+                throw error;
+            }
             return (data || []).map((row: any) => row.channels).filter(Boolean);
         },
         enabled: !!user?.id,

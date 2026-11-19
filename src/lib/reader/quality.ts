@@ -14,13 +14,22 @@
  * Google Play Books does for scanned / non-embedded-font books.
  */
 
+import { hasMathEquationSyntax } from "./sanitize";
+
 /** Characters that indicate a broken font-to-Unicode mapping. */
 const DAMAGED_GLYPH_RE = /[\uFFFD\uE000-\uF8FF]/g;
+/**
+ * Rare script blocks frequently emitted by broken Hindi/Indic PDF ToUnicode CMaps
+ * (e.g. iText subset fonts assigning Devanagari ligatures to Balinese/Ol Chiki/Vedic Ext).
+ */
+const CORRUPT_CMAP_MIX_RE = /[\u1B00-\u1CFF]/g;
 /** A dotted circle means a combining mark lost its base character. */
 const ORPHAN_MARK_RE = /[\u25CC]/g;
 const DEVANAGARI_RE = /[\u0900-\u097F]/;
 const DEVANAGARI_MARK_RE = /[\u093E-\u094D\u0962\u0963]/g;
 const LATIN_WORD_RE = /[A-Za-zÀ-ÿ]+/g;
+const ROMAN_NUMERAL_RE = /^(?:M{0,3})(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$/i;
+const MATH_VAR_RE = /^(?:dx|dy|dz|dt|sin|cos|tan|cot|sec|csc|log|ln|lim|max|min|mod|abs|det|deg|rad|kg|km|cm|mm|mg|ml|hz|ms|us|ns|[a-zA-Z])$/i;
 
 /**
  * Fraction of characters in a RAW (pre-sanitised) string that came out of the
@@ -28,9 +37,13 @@ const LATIN_WORD_RE = /[A-Za-zÀ-ÿ]+/g;
  */
 export function glyphDamageRatio(raw: string): number {
   if (!raw) return 0;
-  const damaged =
+  const directDamaged =
     (raw.match(DAMAGED_GLYPH_RE)?.length ?? 0) + (raw.match(ORPHAN_MARK_RE)?.length ?? 0);
-  return damaged / raw.length;
+  // If Devanagari/Arabic is mixed with Balinese/Ol-Chiki/Cyrillic-Ext-C/Vedic-Ext
+  // glyphs, the PDF font's ToUnicode CMap is corrupted and outputs wrong symbols.
+  const hasIndicOrRtl = /[\u0900-\u097F\u0600-\u06FF]/.test(raw);
+  const corruptMix = hasIndicOrRtl ? (raw.match(CORRUPT_CMAP_MIX_RE)?.length ?? 0) : 0;
+  return (directDamaged + corruptMix * 2) / raw.length;
 }
 
 /**
@@ -50,10 +63,14 @@ export function devanagariLooksBroken(text: string): boolean {
 /**
  * 0 = clean prose, 1 = pure garbage. Tuned against OCR noise and PDF glyph
  * soup like: `i = HE EE | v' : TEE egy. ih = el HE ; : 1 i SAR ii] ik LE el 2`
+ * while preserving genuine ALL-CAPS titles, Roman numerals, and math equations.
  */
 export function garbageScore(text: string): number {
   const trimmed = text.trim();
   if (trimmed.length < 8) return 0;
+
+  // Never misclassify valid mathematical equations/formulas/expressions as garbage.
+  if (hasMathEquationSyntax(trimmed)) return 0;
 
   // Non-Latin scripts (Devanagari, Arabic, CJK…) are checked separately.
   const latin = trimmed.match(LATIN_WORD_RE)?.join("").length ?? 0;
@@ -62,21 +79,35 @@ export function garbageScore(text: string): number {
   const tokens = trimmed.split(/\s+/).filter(Boolean);
   if (tokens.length < 4) return 0;
 
+  const upperCount = trimmed.match(/[A-ZÀ-Ý]/g)?.length ?? 0;
+  const isAllCapsHeadingLine = latin > 0 && upperCount / latin >= 0.72;
+
   let suspicious = 0;
   for (const token of tokens) {
     const word = token.replace(/[^A-Za-zÀ-ÿ]/g, "");
-    const isSymbolOnly = word.length === 0;
-    // Very short fragments that are not real English words.
+    const hasDigit = /\d/.test(token);
+    const isSymbolOnly = word.length === 0 && !hasDigit;
+    // Very short fragments that are not real English words or Roman numerals/units.
     const isStub =
       word.length > 0 &&
       word.length <= 2 &&
-      !/^(a|i|an|as|at|be|by|do|go|he|if|in|is|it|me|my|no|of|on|or|so|to|up|us|we|am|hi|ok)$/i.test(
+      !/^(a|i|an|as|at|be|by|do|go|he|if|in|is|it|me|my|no|of|on|or|so|to|up|us|we|am|hi|ok|mr|ms|dr|st|vs|pm|et|al)$/i.test(
         word
-      );
-    // ALLCAPS fragments mixed inside prose (HE EE TEE SAR) or vowel-less runs.
-    const isShout = /^[A-Z]{2,4}$/.test(word) && word.length <= 4;
-    const isVowelless = word.length >= 4 && !/[aeiouyAEIOUY]/.test(word);
-    if (isSymbolOnly || isStub || isShout || isVowelless) suspicious++;
+      ) &&
+      !ROMAN_NUMERAL_RE.test(word) &&
+      !MATH_VAR_RE.test(word);
+    // ALLCAPS fragments mixed inside normal mixed-case prose (HE EE TEE SAR) —
+    // never penalise genuine ALL-CAPS title/heading lines ("TWO BOY GOLD MINERS").
+    const isShout =
+      !isAllCapsHeadingLine &&
+      /^[A-Z]{2,4}$/.test(word) &&
+      !ROMAN_NUMERAL_RE.test(word);
+    const isVowelless = word.length >= 4 && !/[aeiouyAEIOUY]/.test(word) && !ROMAN_NUMERAL_RE.test(word);
+    const isOcrMixedCase =
+      !isAllCapsHeadingLine &&
+      /^[a-z]{1,3}[A-Z][a-z]{1,5}$/.test(word) &&
+      !/^(eBook|iOS|iPad|iPod|iMac|eBay|dBm|kHz|mAh|mEq|pKa|pH)$/i.test(word);
+    if (isSymbolOnly || isStub || isShout || isVowelless || isOcrMixedCase) suspicious++;
   }
 
   const symbolDensity =
@@ -133,7 +164,7 @@ export function assessPageText(rawLines: string[]): PageQuality {
   }
 
   const glyphDamage = glyphDamageRatio(joined);
-  if (glyphDamage > 0.06) {
+  if (glyphDamage > 0.03) {
     return { unusable: true, glyphDamage, garbageRatio: 0, reason: "glyph-damage" };
   }
 
@@ -144,7 +175,10 @@ export function assessPageText(rawLines: string[]): PageQuality {
   const substantial = rawLines.filter((l) => l.trim().length >= 12);
   const bad = substantial.filter((l) => isGarbageLine(l)).length;
   const garbageRatio = substantial.length ? bad / substantial.length : 0;
-  if (substantial.length >= 4 && garbageRatio >= 0.5) {
+  if (
+    (substantial.length >= 4 && garbageRatio >= 0.5) ||
+    (substantial.length >= 1 && plain.length < 100 && garbageRatio >= 0.5)
+  ) {
     return { unusable: true, glyphDamage, garbageRatio, reason: "ocr-noise" };
   }
 

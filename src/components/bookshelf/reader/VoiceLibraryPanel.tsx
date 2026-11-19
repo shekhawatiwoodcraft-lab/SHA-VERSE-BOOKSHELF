@@ -8,11 +8,16 @@ import {
   type VoiceProfile,
 } from "@/lib/ai/languages";
 import { generateVoicePreviewWav, AiServiceError } from "@/lib/ai/client";
+import { hashTextContent } from "@/lib/ai/segments";
+import {
+  loadCachedAudioSegment,
+  saveCachedAudioSegment,
+  type UserVoicePreferences,
+} from "@/lib/ai/cache";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
-import type { UserVoicePreferences } from "@/lib/ai/cache";
 
 interface VoiceLibraryPanelProps {
   languageCode: string;
@@ -40,22 +45,52 @@ export default function VoiceLibraryPanel({
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewUrlRef = useRef<string | null>(null);
 
+  const previewAbortRef = useRef<AbortController | null>(null);
+
   const langMeta = getLanguageMeta(languageCode);
 
   useEffect(() => {
     return () => {
+      previewAbortRef.current?.abort();
       previewAudioRef.current?.pause();
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
     };
   }, []);
 
   const stopPreview = () => {
+    previewAbortRef.current?.abort();
+    previewAbortRef.current = null;
     previewAudioRef.current?.pause();
     if (previewUrlRef.current) {
       URL.revokeObjectURL(previewUrlRef.current);
       previewUrlRef.current = null;
     }
     setPlayingVoice(null);
+  };
+
+  const primePreviewAudio = () => {
+    if (!previewAudioRef.current) {
+      previewAudioRef.current = new Audio();
+    }
+    const audio = previewAudioRef.current;
+    if (audio.paused) {
+      try {
+        audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+        const p = audio.play();
+        if (p && typeof p.then === "function") {
+          void p
+            .then(() => {
+              if (audio.src.startsWith("data:")) {
+                audio.pause();
+                audio.currentTime = 0;
+              }
+            })
+            .catch(() => {});
+        }
+      } catch {
+        /* ignore gesture priming failures */
+      }
+    }
   };
 
   const handlePreviewVoice = async (voice: VoiceProfile) => {
@@ -66,17 +101,35 @@ export default function VoiceLibraryPanel({
 
     onBeforePreview?.();
     stopPreview();
+    primePreviewAudio();
     setPreviewError(null);
     setPreviewingVoice(voice.id);
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
 
     try {
       const sampleText = langMeta.code === "en" ? voice.exampleText : langMeta.previewPhrase;
-      const blob = await generateVoicePreviewWav({
-        language: langMeta.code,
-        voiceId: voice.id,
-        style: preferences.preferredStyle,
-        sampleText,
-      });
+      const cacheKey = hashTextContent(
+        `preview:${langMeta.code}:${voice.id}:${preferences.preferredStyle}:${sampleText}`,
+      );
+      let blob = await loadCachedAudioSegment(cacheKey);
+      if (!blob) {
+        blob = await generateVoicePreviewWav({
+          language: langMeta.code,
+          voiceId: voice.id,
+          style: preferences.preferredStyle,
+          sampleText,
+          signal: controller.signal,
+        });
+        if (blob && blob.size > 44) {
+          void saveCachedAudioSegment(cacheKey, blob);
+        }
+      }
+
+      if (controller.signal.aborted) return;
+      if (!blob || blob.size <= 44) {
+        throw new Error("Voice preview audio was empty.");
+      }
 
       const url = URL.createObjectURL(blob);
       previewUrlRef.current = url;
@@ -87,16 +140,23 @@ export default function VoiceLibraryPanel({
       const audio = previewAudioRef.current;
       audio.src = url;
       audio.onended = () => setPlayingVoice(null);
+      audio.onerror = () => {
+        setPlayingVoice(null);
+        setPreviewError("Unable to decode voice preview audio.");
+      };
       await audio.play();
       setPlayingVoice(voice.id);
     } catch (err) {
+      if ((err as { name?: string })?.name === "AbortError" || controller.signal.aborted) return;
       if (err instanceof AiServiceError && err.code === "AI_NOT_CONFIGURED") {
         setPreviewError("Voice previews require GEMINI_API_KEY configured in server Settings > Secrets.");
       } else {
         setPreviewError(err instanceof Error ? err.message : "Could not generate voice preview.");
       }
     } finally {
-      setPreviewingVoice(null);
+      if (previewAbortRef.current === controller) {
+        setPreviewingVoice(null);
+      }
     }
   };
 

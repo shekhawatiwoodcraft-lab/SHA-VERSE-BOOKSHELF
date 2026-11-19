@@ -4,6 +4,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { createIdempotencyKey, recordBookDownload, recordBookView } from "@/lib/analytics/tracking";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 export interface BookRating {
   id: string;
@@ -80,7 +81,10 @@ export const useBookInteractions = (bookId?: string) => {
         .select("*")
         .eq("book_id", bookId)
         .order("created_at", { ascending: false });
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return [];
+        throw error;
+      }
       return data as BookRating[];
     },
     enabled: !!bookId,
@@ -98,7 +102,10 @@ export const useBookInteractions = (bookId?: string) => {
         .eq("user_id", user.id)
         .maybeSingle();
 
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return null;
+        throw error;
+      }
 
       return data;
     },

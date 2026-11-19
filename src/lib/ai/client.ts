@@ -1,4 +1,4 @@
-import { getAuthTokenForAi } from "@/lib/ai/cache";
+import { getAuthTokenForAi, refreshAuthTokenForAi } from "@/lib/ai/cache";
 import type {
   GeminiPrebuiltVoiceId,
   NarrationStyleId,
@@ -47,8 +47,8 @@ export interface TranslationBatchResponse {
   cached?: boolean;
 }
 
-async function authHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
-  const token = await getAuthTokenForAi();
+async function authHeaders(extra?: Record<string, string>, forceRefresh = false): Promise<Record<string, string>> {
+  const token = forceRefresh ? await refreshAuthTokenForAi() : await getAuthTokenForAi();
   const headers: Record<string, string> = {
     ...(extra || {}),
   };
@@ -56,6 +56,22 @@ async function authHeaders(extra?: Record<string, string>): Promise<Record<strin
     headers.Authorization = `Bearer ${token}`;
   }
   return headers;
+}
+
+async function fetchWithAuthRetry(
+  url: string,
+  init: Omit<RequestInit, "headers"> & { extraHeaders?: Record<string, string> },
+): Promise<Response> {
+  const { extraHeaders, ...rest } = init;
+  const headers = await authHeaders(extraHeaders, false);
+  const res = await fetch(url, { ...rest, headers });
+  if (res.status === 401 && !rest.signal?.aborted) {
+    const freshHeaders = await authHeaders(extraHeaders, true);
+    if (freshHeaders.Authorization && freshHeaders.Authorization !== headers.Authorization) {
+      return fetch(url, { ...rest, headers: freshHeaders });
+    }
+  }
+  return res;
 }
 
 async function parseErrorResponse(res: Response): Promise<AiServiceError> {
@@ -87,10 +103,9 @@ export async function detectBookLanguage(
   sampleText: string,
   signal?: AbortSignal,
 ): Promise<LanguageDetectionResult> {
-  const headers = await authHeaders({ "Content-Type": "application/json" });
-  const res = await fetch("/api/ai/detect-language", {
+  const res = await fetchWithAuthRetry("/api/ai/detect-language", {
     method: "POST",
-    headers,
+    extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({ sampleText }),
     signal,
   });
@@ -108,10 +123,9 @@ export async function translateBookBatch(params: {
   glossary?: Array<{ source: string; target: string }>;
   signal?: AbortSignal;
 }): Promise<TranslationBatchResponse> {
-  const headers = await authHeaders({ "Content-Type": "application/json" });
-  const res = await fetch("/api/ai/translate", {
+  const res = await fetchWithAuthRetry("/api/ai/translate", {
     method: "POST",
-    headers,
+    extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({
       bookTitle: params.bookTitle,
       sourceLanguage: params.sourceLanguage,
@@ -136,10 +150,9 @@ export async function generateSpeechWav(params: {
   dialogueMode?: boolean;
   signal?: AbortSignal;
 }): Promise<Blob> {
-  const headers = await authHeaders({ "Content-Type": "application/json" });
-  const res = await fetch("/api/ai/tts", {
+  const res = await fetchWithAuthRetry("/api/ai/tts", {
     method: "POST",
-    headers,
+    extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({
       text: params.text,
       language: params.language,
@@ -162,10 +175,9 @@ export async function generateVoicePreviewWav(params: {
   sampleText?: string;
   signal?: AbortSignal;
 }): Promise<Blob> {
-  const headers = await authHeaders({ "Content-Type": "application/json" });
-  const res = await fetch("/api/ai/tts/preview", {
+  const res = await fetchWithAuthRetry("/api/ai/tts/preview", {
     method: "POST",
-    headers,
+    extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({
       language: params.language,
       voiceId: params.voiceId,

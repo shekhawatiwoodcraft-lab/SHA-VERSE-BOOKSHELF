@@ -79,8 +79,14 @@ export interface ReflowBookMeta {
   author?: string;
   language?: string;
   totalPages: number;
-  /** True when at least one page had to be OCR'd. */
+  /** True when at least one page had to be OCR'd or rasterised. */
   scanned: boolean;
+  /** Count of pages where OCR supplied text for scanned image pages. */
+  ocrPages?: number;
+  /** Count of pages rendered as page images due to damaged/non-Unicode PDF fonts or unreadable scans. */
+  rasterizedPages?: number;
+  /** Human-readable notes about OCR or font fallbacks used during extraction. */
+  extractionWarnings?: string[];
   dir: Direction;
 }
 
@@ -115,4 +121,4 @@ export interface Highlight {
   createdAt: number;
 }
 
-export const REFLOW_MODEL_VERSION = 6;
+export const REFLOW_MODEL_VERSION = 7;

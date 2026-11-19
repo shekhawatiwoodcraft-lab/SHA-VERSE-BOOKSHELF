@@ -1,13 +1,15 @@
 import { useEffect, useRef } from "react";
 import { useNavigate, useLocation, useNavigationType } from "react-router-dom";
 import { Capacitor } from "@capacitor/core";
+import { appNavController, resolveRouteFallback } from "@/lib/navigation";
 
 /**
  * AppBackButtonHandler
  * --------------------
- * Wires the Android hardware back button for Bookshelf & Auth routes:
- * - On deep routes (book detail, reader, edit, channel) -> navigate(-1)
- * - On root (/ or /bookshelf or /auth) -> exit app
+ * Tracks true in-app route history and wires Android hardware back so:
+ * 1) Active overlays (Settings, TOC, Search, Sheets) close first
+ * 2) Deep routes pop real in-app history or fall back to contextual parent route
+ * 3) Root routes (/ or /bookshelf or /auth) exit natively on Android
  */
 export const AppBackButtonHandler = () => {
   const navigate = useNavigate();
@@ -15,16 +17,15 @@ export const AppBackButtonHandler = () => {
   const navType = useNavigationType();
 
   const pathRef = useRef(location.pathname);
-  const depth = useRef(0);
 
   useEffect(() => {
     pathRef.current = location.pathname;
-  }, [location.pathname]);
-
-  useEffect(() => {
-    if (navType === "PUSH") depth.current += 1;
-    else if (navType === "POP") depth.current = Math.max(0, depth.current - 1);
-  }, [location.key, navType]);
+    appNavController.recordNavigation(
+      location.key,
+      `${location.pathname}${location.search}`,
+      navType,
+    );
+  }, [location.key, location.pathname, location.search, navType]);
 
   useEffect(() => {
     if (!Capacitor.isNativePlatform()) return;
@@ -36,13 +37,22 @@ export const AppBackButtonHandler = () => {
       .then(({ App }) => {
         if (cancelled) return;
         App.addListener("backButton", () => {
+          if (appNavController.popOverlay()) {
+            return;
+          }
+
           const path = pathRef.current;
           const isRoot = path === "/" || path === "/bookshelf" || path === "/auth";
 
-          if (!isRoot && depth.current > 0) {
+          if (isRoot) {
+            App.exitApp();
+            return;
+          }
+
+          if (appNavController.canGoBack()) {
             navigate(-1);
           } else {
-            App.exitApp();
+            navigate(resolveRouteFallback(path), { replace: true });
           }
         }).then((handle) => {
           if (cancelled) {

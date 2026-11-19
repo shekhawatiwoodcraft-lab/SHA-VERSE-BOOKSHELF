@@ -71,6 +71,7 @@ interface AudiobookContextValue {
   sleepRemainingSec: number | null;
   activeSegment: AudioSegment | null;
   startBookPlayback: (input: AudiobookStartInput) => Promise<void>;
+  unlockAudio: () => void;
   togglePlayPause: () => void;
   pausePlayback: () => void;
   resumePlayback: () => void;
@@ -123,6 +124,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
   const statusRef = useRef<AudiobookStatus>(status);
   const sleepTimerModeRef = useRef<number>(preferences.sleepTimerMinutes);
   const lastSavedListenAtRef = useRef<number>(0);
+  const preloadCooldownUntilRef = useRef<number>(0);
 
   sessionRef.current = session;
   prefsRef.current = preferences;
@@ -137,6 +139,33 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     }
     return audioRef.current;
   }, []);
+
+  /**
+   * Synchronously primes the shared HTMLAudioElement inside a user click gesture
+   * so asynchronous TTS blob arrival never triggers browser NotAllowedError.
+   */
+  const unlockAudio = useCallback(() => {
+    const audio = ensureAudioElement();
+    if (!audio) return;
+    if (audio.paused && (!audio.src || audio.src.startsWith("data:"))) {
+      try {
+        audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+        const p = audio.play();
+        if (p && typeof p.then === "function") {
+          void p
+            .then(() => {
+              if (audio.src.startsWith("data:")) {
+                audio.pause();
+                audio.currentTime = 0;
+              }
+            })
+            .catch(() => {});
+        }
+      } catch {
+        /* ignore browser gesture edge errors */
+      }
+    }
+  }, [ensureAudioElement]);
 
   const revokeCurrentUrl = useCallback(() => {
     if (currentObjectUrlRef.current) {
@@ -189,6 +218,12 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
           await saveCachedAudioSegment(seg.contentHash, blob);
           return blob;
         })
+        .catch((err) => {
+          if (err instanceof AiServiceError && (err.status === 429 || err.code === "RATE_LIMITED")) {
+            preloadCooldownUntilRef.current = Date.now() + 20_000;
+          }
+          throw err;
+        })
         .finally(() => {
           inflightFetchRef.current.delete(seg.contentHash);
         });
@@ -201,16 +236,20 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
 
   const preloadNextSegments = useCallback(
     (sess: AudiobookSession, fromIndex: number, prefs: UserVoicePreferences) => {
-      const candidates = [sess.segments[fromIndex + 1], sess.segments[fromIndex + 2]].filter(Boolean);
-      for (const seg of candidates) {
-        void loadCachedAudioSegment(seg.contentHash).then((hit) => {
+      const nextSeg = sess.segments[fromIndex + 1];
+      if (!nextSeg) return;
+      if (Date.now() < preloadCooldownUntilRef.current) return;
+      window.setTimeout(() => {
+        if (Date.now() < preloadCooldownUntilRef.current) return;
+        if (statusRef.current !== "playing" && statusRef.current !== "loading") return;
+        void loadCachedAudioSegment(nextSeg.contentHash).then((hit) => {
           if (!hit) {
-            void fetchAudioBlob(seg, prefs).catch(() => {
+            void fetchAudioBlob(nextSeg, prefs).catch(() => {
               /* preload failures handled gently when active */
             });
           }
         });
-      }
+      }, 1200);
     },
     [fetchAudioBlob],
   );
@@ -253,30 +292,56 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         audio.volume = volume;
         audio.playbackRate = prefs.preferredSpeed || 1;
 
-        await new Promise<void>((resolve, reject) => {
-          const onReady = () => {
-            cleanup();
-            if (startSec > 0 && Number.isFinite(audio.duration) && startSec < audio.duration) {
-              audio.currentTime = startSec;
-            }
-            resolve();
-          };
-          const onErr = () => {
-            cleanup();
-            reject(new Error("Audio element failed to decode speech segment."));
-          };
-          const cleanup = () => {
-            audio.removeEventListener("canplay", onReady);
-            audio.removeEventListener("error", onErr);
-          };
-          audio.addEventListener("canplay", onReady, { once: true });
-          audio.addEventListener("error", onErr, { once: true });
-          audio.load();
-        });
+        if (audio.readyState < 2) {
+          await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            const onAbort = () => finish(() => reject(new DOMException("Aborted", "AbortError")));
+            const timer = window.setTimeout(
+              () => finish(() => reject(new Error("Audio loading timed out."))),
+              12000,
+            );
+            const cleanup = () => {
+              window.clearTimeout(timer);
+              audio.removeEventListener("canplay", onReady);
+              audio.removeEventListener("loadeddata", onReady);
+              audio.removeEventListener("error", onErr);
+              controller.signal.removeEventListener("abort", onAbort);
+            };
+            const finish = (cb: () => void) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              cb();
+            };
+            const onReady = () => finish(resolve);
+            const onErr = () =>
+              finish(() => reject(new Error("Audio element failed to decode speech segment.")));
+
+            controller.signal.addEventListener("abort", onAbort, { once: true });
+            audio.addEventListener("canplay", onReady, { once: true });
+            audio.addEventListener("loadeddata", onReady, { once: true });
+            audio.addEventListener("error", onErr, { once: true });
+            audio.load();
+          });
+        }
+
+        if (startSec > 0 && Number.isFinite(audio.duration) && startSec < audio.duration) {
+          audio.currentTime = startSec;
+        }
 
         if (controller.signal.aborted) return;
-        await audio.play();
-        setStatus("playing");
+        try {
+          await audio.play();
+          setStatus("playing");
+        } catch (playErr) {
+          if ((playErr as { name?: string })?.name === "NotAllowedError") {
+            setStatus("paused");
+            setError(null);
+            setErrorCode(null);
+            return;
+          }
+          throw playErr;
+        }
         persistProgressNow(updatedSession, audio.currentTime);
         preloadNextSegments(updatedSession, segIndex, prefs);
       } catch (err) {
@@ -315,6 +380,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
           voiceId: prefs.preferredVoice,
           style: prefs.preferredStyle,
           translatedMap,
+          mode: "paragraph",
         });
         if (segments.length > 0) {
           return { chapterIndex: idx, segments };
@@ -647,9 +713,12 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     async (blockId: string, sentenceIndex = 0) => {
       const sess = sessionRef.current;
       if (!sess) return;
-      const existingIdx = sess.segments.findIndex(
+      let existingIdx = sess.segments.findIndex(
         (s) => s.blockId === blockId && s.sentenceIndex === sentenceIndex,
       );
+      if (existingIdx < 0) {
+        existingIdx = sess.segments.findIndex((s) => s.blockId === blockId);
+      }
       if (existingIdx >= 0) {
         await playSegmentAt(sess, existingIdx, 0);
         return;
@@ -676,10 +745,13 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         sess.translatedMap,
       );
       if (!built.segments.length) return;
-      const segIdx = Math.max(
-        0,
-        built.segments.findIndex((s) => s.blockId === blockId && s.sentenceIndex === sentenceIndex),
+      let segIdx = built.segments.findIndex(
+        (s) => s.blockId === blockId && s.sentenceIndex === sentenceIndex,
       );
+      if (segIdx < 0) {
+        segIdx = built.segments.findIndex((s) => s.blockId === blockId);
+      }
+      segIdx = Math.max(0, segIdx);
       const nextSess: AudiobookSession = {
         ...sess,
         currentChapterIndex: built.chapterIndex,
@@ -877,6 +949,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       sleepRemainingSec,
       activeSegment,
       startBookPlayback,
+      unlockAudio,
       togglePlayPause,
       pausePlayback,
       resumePlayback,
@@ -914,6 +987,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       sleepRemainingSec,
       activeSegment,
       startBookPlayback,
+      unlockAudio,
       togglePlayPause,
       pausePlayback,
       resumePlayback,

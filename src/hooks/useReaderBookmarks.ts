@@ -3,6 +3,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { useEffect } from "react";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 export interface ReaderBookmark {
   id: string;
@@ -28,7 +29,10 @@ export const useReaderBookmarks = (bookId?: string) => {
         .eq("user_id", user.id)
         .eq("book_id", bookId)
         .order("created_at", { ascending: false });
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return [];
+        throw error;
+      }
       return (data || []) as unknown as ReaderBookmark[];
     },
     enabled: !!bookId && !!user?.id,

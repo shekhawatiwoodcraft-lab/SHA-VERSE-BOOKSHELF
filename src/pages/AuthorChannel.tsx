@@ -20,14 +20,18 @@ import { excludeSeedBooks } from "@/modules/bookshelf/lib/seedFilter";
 import { recordBookView } from "@/lib/analytics/tracking";
 import { ChannelAnalyticsPanel } from "@/components/bookshelf/analytics/ChannelAnalyticsPanel";
 import { toast } from "sonner";
+import { useRegisterBackOverlay, useSmartBack } from "@/lib/navigation";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 const AuthorChannel = () => {
   const { channelId } = useParams();
   const navigate = useNavigate();
+  const handleBack = useSmartBack("/bookshelf");
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
   const [showShareDialog, setShowShareDialog] = useState(false);
+  useRegisterBackOverlay(showShareDialog, "author-channel-share", () => setShowShareDialog(false));
 
   const { data: channel, isLoading: channelLoading } = useQuery({
     queryKey: ["author-channel", channelId],
@@ -37,7 +41,10 @@ const AuthorChannel = () => {
         .select("*")
         .eq("id", channelId)
         .single();
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return null;
+        throw error;
+      }
       return data;
     },
     enabled: !!channelId,
@@ -57,7 +64,10 @@ const AuthorChannel = () => {
           .eq("channel_id", channelId)
           .order("created_at", { ascending: false })
       );
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return [];
+        throw error;
+      }
       return data;
     },
     enabled: !!channelId,
@@ -77,7 +87,10 @@ const AuthorChannel = () => {
           .eq("channel_id", channelId)
       );
       
-      if (statsError) throw statsError;
+      if (statsError) {
+        if (isSchemaMissingError(statsError)) return { totalViews: 0, totalDownloads: 0, booksCount: 0 };
+        throw statsError;
+      }
       
       const totalViews = bookStats?.reduce((sum, book) => sum + (book.views_count || 0), 0) || 0;
       const totalDownloads = bookStats?.reduce((sum, book) => sum + (book.downloads_count || 0), 0) || 0;
@@ -206,7 +219,7 @@ const AuthorChannel = () => {
       {/* Header */}
       <header className="sticky top-0 z-40 bg-card/80 backdrop-blur-lg border-b">
         <div className="max-w-6xl mx-auto px-4 py-3 flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+          <Button variant="ghost" size="icon" aria-label="Back" onClick={() => handleBack()}>
             <ArrowLeft className="w-5 h-5" />
           </Button>
           <h1 className="font-semibold truncate flex-1">{channel.name}</h1>

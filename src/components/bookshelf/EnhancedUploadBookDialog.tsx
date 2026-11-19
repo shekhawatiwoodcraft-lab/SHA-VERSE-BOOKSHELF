@@ -28,7 +28,9 @@ import {
 import { useBooks } from "@/hooks/useBooks";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
+import { useNavigate } from "react-router-dom";
 import CopyrightAgreementDialog from "./CopyrightAgreementDialog";
+import { useRegisterBackOverlay } from "@/lib/navigation";
 
 interface EnhancedUploadBookDialogProps {
   open: boolean;
@@ -95,8 +97,11 @@ const EnhancedUploadBookDialog = ({
   onOpenChange,
   channelId,
 }: EnhancedUploadBookDialogProps) => {
+  const navigate = useNavigate();
   const { uploadBook } = useBooks();
   const { user } = useAuth();
+  const handleOverlayBack = useCallback(() => onOpenChange(false), [onOpenChange]);
+  useRegisterBackOverlay(open, "enhanced-upload-book-dialog", handleOverlayBack);
   const [step, setStep] = useState<UploadStep>("form");
   const [uploadProgress, setUploadProgress] = useState(0);
   const [processingSteps, setProcessingSteps] = useState<ProcessingStep[]>(INITIAL_PROCESSING_STEPS);
@@ -1449,9 +1454,7 @@ const EnhancedUploadBookDialog = ({
                 onClick={() => { 
                   handleClose(); 
                   if (publishedBookId) {
-                    window.location.href = `/book/${publishedBookId}`;
-                  } else {
-                    window.location.reload();
+                    navigate(`/bookshelf/book/${publishedBookId}`);
                   }
                 }}
               >
@@ -1473,7 +1476,7 @@ const EnhancedUploadBookDialog = ({
                   variant="outline"
                   onClick={() => {
                     const shareUrl = publishedBookId 
-                      ? `${window.location.origin}/book/${publishedBookId}`
+                      ? `${window.location.origin}/bookshelf/book/${publishedBookId}`
                       : window.location.href;
                     navigator.clipboard.writeText(shareUrl);
                     toast.success("Link copied to clipboard!");

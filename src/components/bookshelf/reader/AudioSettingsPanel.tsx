@@ -380,7 +380,7 @@ export default function AudioSettingsPanel({
             <span className="font-medium">Playback speed</span>
             <span className="tabular-nums opacity-75">{preferences.preferredSpeed}x</span>
           </div>
-          <div className="grid grid-cols-6 gap-1">
+          <div className="grid grid-cols-4 sm:grid-cols-7 gap-1">
             {PLAYBACK_SPEEDS.map((spd) => (
               <Button
                 key={spd}

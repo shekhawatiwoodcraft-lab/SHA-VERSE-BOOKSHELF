@@ -20,7 +20,7 @@ interface RecoveryEmailProps {
   confirmationUrl: string
 }
 
-const LOGO_URL = 'https://plmhjuqedtkiffzhberf.supabase.co/storage/v1/object/public/email-assets/sha-verse-logo.jpeg'
+const LOGO_URL = 'https://www.sha-verse.com/sha-verse-logo.jpeg'
 
 export const RecoveryEmail = ({
   siteName,

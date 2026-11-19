@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { BOOK_PUBLIC_COLUMNS, HIDE_SEED_BOOKS, SEED_BOOK_URL } from "@/lib/constants/bookshelf";
 import { excludeSeedBooks } from "@/modules/bookshelf/lib/seedFilter";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 import {
   aggregateChannelTotals,
   buildAnalyticsTimeSeries,
@@ -382,7 +383,10 @@ export function useChannelAnalytics({
         fetchChannelBooks(channelId),
       ]);
 
-      if (channelRes.error) throw channelRes.error;
+      if (channelRes.error) {
+        if (isSchemaMissingError(channelRes.error)) return null;
+        throw channelRes.error;
+      }
       bookIdsRef.current = new Set(books.map((b) => b.id));
 
       const eventPayload = await fetchChannelEventsAndFallback(channelId, books);

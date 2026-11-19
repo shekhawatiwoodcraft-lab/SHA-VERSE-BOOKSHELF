@@ -4,6 +4,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { Card } from "@/components/ui/card";
 import { BarChart3 } from "lucide-react";
 import { ChannelAnalyticsPanel } from "@/components/bookshelf/analytics/ChannelAnalyticsPanel";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 const AnalyticsDashboard = () => {
   const { user } = useAuth();
@@ -18,7 +19,10 @@ const AnalyticsDashboard = () => {
         .eq("user_id", user.id)
         .eq("channel_type", "books")
         .maybeSingle();
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return null;
+        throw error;
+      }
       return data;
     },
     enabled: !!user?.id,

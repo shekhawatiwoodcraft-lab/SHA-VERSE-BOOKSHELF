@@ -10,7 +10,12 @@ export interface OcrWorker {
 
 export async function createOcrWorker(language = "eng"): Promise<OcrWorker> {
   const { createWorker } = await import("tesseract.js");
-  const worker: any = await createWorker(language);
+  let worker: any;
+  try {
+    worker = await createWorker(language);
+  } catch {
+    worker = await createWorker("eng");
+  }
 
   return {
     async recognize(image: Blob) {

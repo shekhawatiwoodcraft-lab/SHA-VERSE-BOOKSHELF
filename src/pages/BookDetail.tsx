@@ -32,11 +32,14 @@ import CommentSection from "@/components/bookshelf/CommentSection";
 import { BannerAd, NativeAdCard, NativeAdSlot } from "@/components/ads";
 import { isNativeAdsSupported } from "@/lib/ads/native/bridge";
 import { BOOK_PUBLIC_COLUMNS } from "@/lib/constants/bookshelf";
+import { useRegisterBackOverlay, useSmartBack } from "@/lib/navigation";
+import { isSchemaMissingError } from "@/integrations/supabase/config";
 
 // BookDetail page component
 const BookDetail = () => {
   const { bookId } = useParams();
   const navigate = useNavigate();
+  const handleBack = useSmartBack("/bookshelf");
   const location = useLocation();
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -44,6 +47,11 @@ const BookDetail = () => {
   const [showDeletionDialog, setShowDeletionDialog] = useState(false);
   const [showShareDialog, setShowShareDialog] = useState(false);
   const [showReportDialog, setShowReportDialog] = useState(false);
+
+  useRegisterBackOverlay(showRatingDialog, "book-detail-rating", () => setShowRatingDialog(false));
+  useRegisterBackOverlay(showDeletionDialog, "book-detail-deletion", () => setShowDeletionDialog(false));
+  useRegisterBackOverlay(showShareDialog, "book-detail-share", () => setShowShareDialog(false));
+  useRegisterBackOverlay(showReportDialog, "book-detail-report", () => setShowReportDialog(false));
   const [comment, setComment] = useState("");
   const [commentsExpanded, setCommentsExpanded] = useState(true);
   const [ratingsExpanded, setRatingsExpanded] = useState(true);
@@ -61,7 +69,10 @@ const BookDetail = () => {
         `)
         .eq("id", bookId)
         .single();
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return null;
+        throw error;
+      }
       return data;
     },
     enabled: !!bookId,
@@ -86,7 +97,12 @@ const BookDetail = () => {
           .maybeSingle(),
       ]);
 
-      if (booksRes.error) throw booksRes.error;
+      if (booksRes.error) {
+        if (isSchemaMissingError(booksRes.error)) {
+          return { totalBooks: 0, totalViews: 0, totalDownloads: 0, subscribers: book?.channel?.subscribers_count || 0 };
+        }
+        throw booksRes.error;
+      }
 
       const data = booksRes.data;
       const totalViews = data?.reduce((sum, b) => sum + (b.views_count || 0), 0) || 0;
@@ -356,7 +372,7 @@ const BookDetail = () => {
       {/* Header */}
       <header className="sticky top-0 z-40 bg-card/80 backdrop-blur-lg border-b">
         <div className="max-w-4xl mx-auto px-4 py-3 flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+          <Button variant="ghost" size="icon" aria-label="Back" onClick={() => handleBack()}>
             <ArrowLeft className="w-5 h-5" />
           </Button>
           <h1 className="font-semibold truncate flex-1">{book.title}</h1>

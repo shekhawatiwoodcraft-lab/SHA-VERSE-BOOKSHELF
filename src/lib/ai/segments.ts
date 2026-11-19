@@ -16,6 +16,8 @@ export interface AudioSegment {
   blockIndex: number;
   sentenceIndex: number;
   sentenceCount: number;
+  charStart?: number;
+  charEnd?: number;
   page: number;
   text: string;
   language: string;
@@ -28,6 +30,19 @@ export interface AudioSegment {
 export interface DialogueTurn {
   speaker: "Narrator" | "Speaker";
   text: string;
+}
+
+/**
+ * Strips optional markdown code fences around JSON responses from LLM providers
+ * before parsing.
+ */
+export function parseModelJson<T>(rawText: string): T {
+  const cleaned = String(rawText || "{}")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  return JSON.parse(cleaned || "{}") as T;
 }
 
 const ABBREVIATION_RE =
@@ -214,8 +229,10 @@ export function getChapterBlockRange(
 }
 
 /**
- * Generates sentence-aligned audio segments for a chapter (or translated chapter blocks)
- * so text highlighting and playback position stay strictly synchronized.
+ * Generates audio segments for a chapter (or translated chapter blocks).
+ * - mode="sentence" (default): 1 segment per sentence.
+ * - mode="paragraph": 1 cohesive segment per paragraph (up to maxCharsPerSegment chars),
+ *   dramatically reducing TTS API round-trips and eliminating inter-sentence gaps.
  */
 export function buildChapterAudioSegments(params: {
   bookId: string;
@@ -227,6 +244,8 @@ export function buildChapterAudioSegments(params: {
   voiceId: string;
   style: string;
   translatedMap?: Record<string, string>;
+  mode?: "sentence" | "paragraph";
+  maxCharsPerSegment?: number;
 }): AudioSegment[] {
   const {
     bookId,
@@ -238,6 +257,8 @@ export function buildChapterAudioSegments(params: {
     voiceId,
     style,
     translatedMap,
+    mode = "sentence",
+    maxCharsPerSegment = 850,
   } = params;
 
   const segments: AudioSegment[] = [];
@@ -251,14 +272,65 @@ export function buildChapterAudioSegments(params: {
     if (!trimmed) continue;
 
     const sentences = splitIntoSentences(trimmed);
-    const list = sentences.length
+    const baseSpans = sentences.length
       ? sentences
       : [{ index: 0, start: 0, end: trimmed.length, text: trimmed }];
 
-    for (const s of list) {
+    let chunkList: Array<{ index: number; start: number; end: number; text: string }>;
+    if (mode === "paragraph") {
+      if (trimmed.length <= maxCharsPerSegment) {
+        chunkList = [
+          {
+            index: baseSpans.length <= 1 ? 0 : -1,
+            start: 0,
+            end: trimmed.length,
+            text: trimmed,
+          },
+        ];
+      } else {
+        chunkList = [];
+        let accTexts: string[] = [];
+        let accStart = baseSpans[0].start;
+        let accEnd = baseSpans[0].end;
+        let accLen = 0;
+
+        for (const s of baseSpans) {
+          const addedLen = (accTexts.length > 0 ? 1 : 0) + s.text.length;
+          if (accTexts.length > 0 && accLen + addedLen > maxCharsPerSegment) {
+            chunkList.push({
+              index: chunkList.length,
+              start: accStart,
+              end: accEnd,
+              text: accTexts.join(" "),
+            });
+            accTexts = [s.text];
+            accStart = s.start;
+            accEnd = s.end;
+            accLen = s.text.length;
+          } else {
+            if (accTexts.length === 0) accStart = s.start;
+            accTexts.push(s.text);
+            accEnd = s.end;
+            accLen += addedLen;
+          }
+        }
+        if (accTexts.length > 0) {
+          chunkList.push({
+            index: chunkList.length,
+            start: accStart,
+            end: accEnd,
+            text: accTexts.join(" "),
+          });
+        }
+      }
+    } else {
+      chunkList = baseSpans;
+    }
+
+    for (const s of chunkList) {
       const hasDialogue = detectDialogueParts(s.text).some((p) => p.speaker === "Speaker");
       const contentHash = hashTextContent(
-        `${bookId}:${block.id}:${s.index}:${language}:${voiceId}:${style}:${s.text}`,
+        `${bookId}:${block.id}:${mode}:${s.index}:${language}:${voiceId}:${style}:${s.text}`,
       );
       segments.push({
         id: `${chapter.id}_${block.id}_s${s.index}_${contentHash.slice(0, 8)}`,
@@ -268,7 +340,9 @@ export function buildChapterAudioSegments(params: {
         blockId: block.id,
         blockIndex: bi,
         sentenceIndex: s.index,
-        sentenceCount: list.length,
+        sentenceCount: chunkList.length,
+        charStart: s.start,
+        charEnd: s.end,
         page: block.page,
         text: s.text,
         language,
@@ -313,6 +387,37 @@ export function extractCandidateGlossaryTerms(blocks: Block[], maxTerms = 24): s
 }
 
 /**
+ * Groups blocks into translation batches obeying BOTH block-count and total
+ * character-budget limits so long paragraphs never trigger server 400 errors.
+ */
+export function chunkBlocksByBudget<T extends { id: string; text: string }>(
+  blocks: T[],
+  maxBlocks = 10,
+  maxChars = 16_000,
+): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let currentChars = 0;
+
+  for (const block of blocks) {
+    const len = Math.min(block.text.length, 5800);
+    if (
+      current.length > 0 &&
+      (current.length >= maxBlocks || currentChars + len > maxChars)
+    ) {
+      batches.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(block);
+    currentChars += len;
+  }
+
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/**
  * Validates that a translated batch returned by the AI model matches the
  * exact requested block IDs in order, with non-empty translations for non-empty sources.
  */
@@ -326,12 +431,12 @@ export function validateTranslationBatch(
   const byId = new Map<string, string>();
   for (const item of translatedItems) {
     if (!item || typeof item.id !== "string" || typeof item.translatedText !== "string") continue;
-    byId.set(item.id, item.translatedText.trim());
+    byId.set(item.id.trim(), item.translatedText.trim());
   }
 
   const map: Record<string, string> = {};
   for (const src of sourceBlocks) {
-    const translated = byId.get(src.id);
+    const translated = byId.get(src.id.trim());
     if (src.text.trim().length > 0 && (!translated || translated.length === 0)) {
       return {
         valid: false,

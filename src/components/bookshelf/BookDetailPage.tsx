@@ -34,10 +34,12 @@ import BookReportDialog from "./BookReportDialog";
 import CommentSection from "./CommentSection";
 import { BannerAd, RewardedAdButton, StickyBannerAd } from "@/components/ads";
 import { useRewardedAd } from "@/hooks/useRewardedAd";
+import { useSmartBack } from "@/lib/navigation";
 
 const BookDetailPage = () => {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const handleBack = useSmartBack("/bookshelf");
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(0);
   const [isReading, setIsReading] = useState(false);
@@ -168,7 +170,8 @@ const BookDetailPage = () => {
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => navigate('/bookshelf')}
+              aria-label="Back"
+              onClick={() => handleBack()}
             >
               <ChevronLeft className="w-5 h-5" />
             </Button>

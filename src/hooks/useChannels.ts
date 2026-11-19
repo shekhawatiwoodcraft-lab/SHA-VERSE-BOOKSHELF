@@ -4,6 +4,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/contexts/AuthContext';
 import { toast } from 'sonner';
 import { compressImage } from '@/lib/media/compressImage';
+import { isSchemaMissingError, SCHEMA_SETUP_HINT } from '@/integrations/supabase/config';
 
 export const useChannels = (channelType: 'books' = 'books') => {
   const { user } = useAuth();
@@ -18,7 +19,10 @@ export const useChannels = (channelType: 'books' = 'books') => {
         .eq('channel_type', channelType)
         .order('subscribers_count', { ascending: false });
 
-      if (error) throw error;
+      if (error) {
+        if (isSchemaMissingError(error)) return [];
+        throw error;
+      }
       return data;
     },
   });
@@ -87,6 +91,10 @@ export const useChannels = (channelType: 'books' = 'books') => {
       toast.success('Channel created successfully!');
     },
     onError: (error) => {
+      if (isSchemaMissingError(error)) {
+        toast.error(SCHEMA_SETUP_HINT);
+        return;
+      }
       toast.error('Failed to create channel: ' + error.message);
     },
   });
