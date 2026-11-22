@@ -70,6 +70,15 @@ interface Props {
   onParagraphAudioClick?: (blockId: string) => void;
   onParagraphTranslateClick?: (blockId: string) => void;
   onCloseInlineTranslation?: (blockId: string) => void;
+  onSelectionChangeText?: (text: string) => void;
+  onSelectionAudio?: (text: string, isTranslated?: boolean, languageOverride?: string) => void;
+  onSelectionTranslate?: (text: string) => Promise<{
+    translatedText: string;
+    languageCode: string;
+    languageName: string;
+    nativeName: string;
+    dir: "ltr" | "rtl";
+  }>;
   inlineTranslations?: Record<string, string>;
   inlineTranslationVisible?: Record<string, boolean>;
   inlineTranslatingIds?: Record<string, boolean>;
@@ -844,6 +853,9 @@ const PaginatedReader = ({
   onParagraphAudioClick,
   onParagraphTranslateClick,
   onCloseInlineTranslation,
+  onSelectionChangeText,
+  onSelectionAudio,
+  onSelectionTranslate,
   inlineTranslations,
   inlineTranslationVisible,
   inlineTranslatingIds,
@@ -874,6 +886,20 @@ const PaginatedReader = ({
     top: number;
     left: number;
   } | null>(null);
+  const [selectionResult, setSelectionResult] = useState<{
+    originalText: string;
+    top: number;
+    left: number;
+    loading: boolean;
+    translatedText?: string;
+    languageCode?: string;
+    languageName?: string;
+    nativeName?: string;
+    dir?: "ltr" | "rtl";
+    error?: string;
+  } | null>(null);
+  const onSelectionChangeTextRef = useRef(onSelectionChangeText);
+  onSelectionChangeTextRef.current = onSelectionChangeText;
 
   /* --- sanitise blocks once per book revision -----------------------------
    * Second line of defence (older cached books were extracted before the
@@ -1295,15 +1321,17 @@ const PaginatedReader = ({
       const start = offsetWithin(textRoot, range.startContainer, range.startOffset);
       const rect = range.getBoundingClientRect();
       const containerRect = container.getBoundingClientRect();
+      onSelectionChangeTextRef.current?.(text);
+      const halfToolbarPad = Math.min(200, Math.max(120, containerRect.width * 0.42));
       setSelection({
         blockId: startEl.dataset.blockId!,
         start,
         end: start + sel.toString().length,
         text,
-        top: rect.top - containerRect.top - 48,
+        top: rect.top - containerRect.top - 52,
         left: Math.min(
-          Math.max(rect.left - containerRect.left + rect.width / 2, 90),
-          containerRect.width - 90
+          Math.max(rect.left - containerRect.left + rect.width / 2, halfToolbarPad),
+          Math.max(containerRect.width - halfToolbarPad, halfToolbarPad),
         ),
       });
     };
@@ -1314,6 +1342,42 @@ const PaginatedReader = ({
   const clearSelection = () => {
     window.getSelection()?.removeAllRanges();
     setSelection(null);
+  };
+
+  const handleTriggerSelectionTranslate = async () => {
+    if (!selection || !onSelectionTranslate) return;
+    const snap = { ...selection };
+    const anchorTop = Math.max((scrollRef.current?.getBoundingClientRect().top ?? 0) + snap.top + 48, 56);
+    const anchorLeft = (scrollRef.current?.getBoundingClientRect().left ?? 0) + snap.left;
+    clearSelection();
+    setSelectionResult({
+      originalText: snap.text,
+      top: anchorTop,
+      left: anchorLeft,
+      loading: true,
+    });
+    try {
+      const res = await onSelectionTranslate(snap.text);
+      setSelectionResult({
+        originalText: snap.text,
+        top: anchorTop,
+        left: anchorLeft,
+        loading: false,
+        translatedText: res.translatedText,
+        languageCode: res.languageCode,
+        languageName: res.languageName,
+        nativeName: res.nativeName,
+        dir: res.dir,
+      });
+    } catch (err) {
+      setSelectionResult({
+        originalText: snap.text,
+        top: anchorTop,
+        left: anchorLeft,
+        loading: false,
+        error: err instanceof Error ? err.message : "Could not translate selected text.",
+      });
+    }
   };
 
   /* -------------------------------- gestures ------------------------------ */
@@ -1406,60 +1470,181 @@ const PaginatedReader = ({
     </>
   );
 
-  const selectionToolbar =
-    selection && onCreateHighlight ? (
-      <div
-        data-reader-toolbar
-        className="fixed z-50 flex items-center gap-1 rounded-full px-1.5 py-1 shadow-lg"
-        style={{
-          top: Math.max((scrollRef.current?.getBoundingClientRect().top ?? 0) + selection.top, 8),
-          left: (scrollRef.current?.getBoundingClientRect().left ?? 0) + selection.left,
-          transform: "translateX(-50%)",
-          backgroundColor: !isDarkReaderTheme(settings.theme) ? "#1f2430" : "#2b2f36",
-          color: "#fff",
-        }}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <button
-          type="button"
-          className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
-          onClick={() => {
-            onCreateHighlight({ ...selection, withNote: false });
-            clearSelection();
+  const selectionToolbar = (
+    <>
+      {selection ? (
+        <div
+          data-reader-toolbar
+          className="fixed z-50 flex flex-wrap items-center justify-center gap-1 rounded-2xl px-2 py-1 shadow-xl max-w-[92vw]"
+          style={{
+            top: Math.max((scrollRef.current?.getBoundingClientRect().top ?? 0) + selection.top, 8),
+            left: Math.min(
+              Math.max(
+                (scrollRef.current?.getBoundingClientRect().left ?? 0) + selection.left,
+                Math.min(205, (typeof window !== "undefined" ? window.innerWidth : 800) / 2),
+              ),
+              Math.max(
+                (typeof window !== "undefined" ? window.innerWidth : 800) - 205,
+                (typeof window !== "undefined" ? window.innerWidth : 800) / 2,
+              ),
+            ),
+            transform: "translateX(-50%)",
+            backgroundColor: !isDarkReaderTheme(settings.theme) ? "#1f2430" : "#2b2f36",
+            color: "#fff",
           }}
+          onClick={(event) => event.stopPropagation()}
         >
-          <Highlighter className="h-3.5 w-3.5" /> Highlight
-        </button>
-        <button
-          type="button"
-          className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
-          onClick={() => {
-            onCreateHighlight({ ...selection, withNote: true });
-            clearSelection();
+          {onSelectionAudio && (
+            <button
+              type="button"
+              className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
+              onClick={() => {
+                onSelectionAudio(selection.text, false);
+                clearSelection();
+              }}
+            >
+              <Volume2 className="h-3.5 w-3.5" /> Listen
+            </button>
+          )}
+          {onSelectionTranslate && (
+            <button
+              type="button"
+              className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
+              onClick={() => void handleTriggerSelectionTranslate()}
+            >
+              <Languages className="h-3.5 w-3.5" /> Translate
+            </button>
+          )}
+          {onCreateHighlight && (
+            <>
+              <button
+                type="button"
+                className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
+                onClick={() => {
+                  onCreateHighlight({ ...selection, withNote: false });
+                  clearSelection();
+                }}
+              >
+                <Highlighter className="h-3.5 w-3.5" /> Highlight
+              </button>
+              <button
+                type="button"
+                className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
+                onClick={() => {
+                  onCreateHighlight({ ...selection, withNote: true });
+                  clearSelection();
+                }}
+              >
+                <StickyNote className="h-3.5 w-3.5" /> Note
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
+            onClick={() => {
+              void navigator.clipboard?.writeText(selection.text);
+              clearSelection();
+            }}
+          >
+            <Copy className="h-3.5 w-3.5" /> Copy
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="rounded-full p-1.5 hover:bg-white/15"
+            onClick={clearSelection}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ) : null}
+
+      {selectionResult ? (
+        <div
+          data-reader-toolbar
+          role="dialog"
+          aria-label="Selection translation"
+          className="fixed z-50 w-[min(92vw,380px)] rounded-xl border p-3 shadow-2xl space-y-2"
+          style={{
+            top: Math.min(selectionResult.top, Math.max(80, (typeof window !== "undefined" ? window.innerHeight : 700) - 220)),
+            left: Math.min(
+              Math.max(selectionResult.left, 190),
+              Math.max(190, (typeof window !== "undefined" ? window.innerWidth : 800) - 190),
+            ),
+            transform: "translateX(-50%)",
+            backgroundColor: theme.bg,
+            color: theme.text,
+            borderColor: theme.border,
           }}
+          onClick={(event) => event.stopPropagation()}
         >
-          <StickyNote className="h-3.5 w-3.5" /> Note
-        </button>
-        <button
-          type="button"
-          className="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-xs hover:bg-white/15"
-          onClick={() => {
-            void navigator.clipboard?.writeText(selection.text);
-            clearSelection();
-          }}
-        >
-          <Copy className="h-3.5 w-3.5" /> Copy
-        </button>
-        <button
-          type="button"
-          aria-label="Dismiss"
-          className="rounded-full p-1.5 hover:bg-white/15"
-          onClick={clearSelection}
-        >
-          <X className="h-3.5 w-3.5" />
-        </button>
-      </div>
-    ) : null;
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <span className="font-semibold">
+              {selectionResult.loading
+                ? "Translating selection..."
+                : selectionResult.nativeName
+                  ? `Translated (${selectionResult.nativeName})`
+                  : "Selection Translation"}
+            </span>
+            <button
+              type="button"
+              aria-label="Close selection translation"
+              className="rounded-md p-1 opacity-70 hover:opacity-100"
+              onClick={() => setSelectionResult(null)}
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          {selectionResult.loading ? (
+            <div className="flex items-center gap-2 py-2 text-xs opacity-75">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <span>Preparing translation...</span>
+            </div>
+          ) : selectionResult.error ? (
+            <p className="text-xs text-destructive">{selectionResult.error}</p>
+          ) : (
+            <>
+              <p
+                className="text-sm leading-relaxed max-h-40 overflow-y-auto"
+                dir={selectionResult.dir || "ltr"}
+              >
+                {selectionResult.translatedText}
+              </p>
+              <div className="flex items-center gap-2 pt-1 flex-wrap">
+                {onSelectionAudio && selectionResult.translatedText && (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium border"
+                    style={{ borderColor: theme.border }}
+                    onClick={() =>
+                      onSelectionAudio(
+                        selectionResult.translatedText!,
+                        true,
+                        selectionResult.languageCode,
+                      )
+                    }
+                  >
+                    <Volume2 className="h-3 w-3" /> Listen Translated
+                  </button>
+                )}
+                {onSelectionAudio && (
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs opacity-85 border"
+                    style={{ borderColor: theme.border }}
+                    onClick={() => onSelectionAudio(selectionResult.originalText, false)}
+                  >
+                    <Volume2 className="h-3 w-3" /> Listen Original
+                  </button>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      ) : null}
+    </>
+  );
 
   const brightnessOverlayOpacity = Math.max(0, Math.min(0.5, 1 - (settings.brightness ?? 1)));
   const warmthOverlayOpacity = Math.max(0, Math.min(0.35, settings.warmth ?? 0));

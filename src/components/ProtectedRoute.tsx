@@ -1,8 +1,9 @@
 import { useAuth } from '@/contexts/AuthContext';
-import { Navigate } from 'react-router-dom';
+import { Navigate, useLocation } from 'react-router-dom';
 
 export const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user, loading } = useAuth();
+  const location = useLocation();
 
   if (loading) {
     return (
@@ -16,7 +17,13 @@ export const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ childr
   }
 
   if (!user) {
-    return <Navigate to="/auth" replace />;
+    const hasOAuthError =
+      /(?:^|[?&])error(?:_description)?=/.test(location.search) ||
+      /(?:^|[#&])error(?:_description)?=/.test(location.hash);
+    const target = hasOAuthError
+      ? `/auth${location.search}${location.hash}`
+      : "/auth";
+    return <Navigate to={target} replace />;
   }
 
   return <>{children}</>;

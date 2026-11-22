@@ -47,24 +47,24 @@ const TEST_AD_IDS = {
   stickyBanner: "ca-app-pub-3940256099942544/6300978111",
 } as const;
 
-// ✅ Real Sha-Verse AdMob unit IDs (used when USE_TEST_ADS = false on Play Store launch).
-// Slots without a dedicated real unit reuse the closest matching real format
-// (native for sponsored cards, video for shorts) so no slot ever serves an empty ID.
+// ✅ Real SHA-VERSE: BOOKSHELF AdMob unit IDs (used when USE_TEST_ADS = false on Play Store launch).
+// Slots without a dedicated unit reuse the closest matching real format from this app
+// so no slot ever serves an empty or mismatched ID.
 const LIVE_AD_IDS = {
-  banner: "ca-app-pub-2928763177849470/4320904440", // SHA-VERSE_BANNER HOME
-  native: "ca-app-pub-2928763177849470/9916461611", // SHA-VERSE_NATIVE FEED
-  rewarded: "ca-app-pub-2928763177849470/8765965812", // generic fallback (Bookshelf)
-  rewardedBookshelf: "ca-app-pub-2928763177849470/8765965812", // SHA-VERSE_REWARDED BOOKSHELF
-  rewardedMovion: "ca-app-pub-2928763177849470/9064899001", // SHA-VERSE_REWARDED MOVION
-  rewardedNovachat: "ca-app-pub-2928763177849470/8691394298", // SHA-VERSE_REWARDED NOVACHAT
-  groupBoost: "ca-app-pub-2928763177849470/3370168902", // SHA-VERSE_GROUPBOOST
-  videoPreRoll: "ca-app-pub-2928763177849470/1186858692", // SHA-VERSE_VIDEO PRE ROLL
-  videoMidRoll: "ca-app-pub-2928763177849470/4391156828", // SHA-VERSE_VIDEO MID ROLL
-  shorts: "ca-app-pub-2928763177849470/4391156828", // reuse video (no dedicated unit)
-  sponsoredStory: "ca-app-pub-2928763177849470/9916461611", // reuse native feed
-  sponsoredGroup: "ca-app-pub-2928763177849470/9916461611", // reuse native feed
-  sponsoredSuggestion: "ca-app-pub-2928763177849470/9916461611", // reuse native feed
-  stickyBanner: "ca-app-pub-2928763177849470/3634958446", // SHA-VERSE_STICKY BANNER
+  banner: "ca-app-pub-2928763177849470/7809202558", // INLINE/HOME BANNER
+  native: "ca-app-pub-2928763177849470/4855736154", // NATIVE ADVANCED
+  rewarded: "ca-app-pub-2928763177849470/2220787777", // REWARDED
+  rewardedBookshelf: "ca-app-pub-2928763177849470/2220787777", // REWARDED
+  rewardedMovion: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED
+  rewardedNovachat: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED
+  groupBoost: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED
+  videoPreRoll: "ca-app-pub-2928763177849470/1186858692", // legacy video slot (unused in Bookshelf)
+  videoMidRoll: "ca-app-pub-2928763177849470/4391156828", // legacy video slot (unused in Bookshelf)
+  shorts: "ca-app-pub-2928763177849470/4391156828", // legacy video slot (unused in Bookshelf)
+  sponsoredStory: "ca-app-pub-2928763177849470/4855736154", // reuse NATIVE ADVANCED
+  sponsoredGroup: "ca-app-pub-2928763177849470/4855736154", // reuse NATIVE ADVANCED
+  sponsoredSuggestion: "ca-app-pub-2928763177849470/4855736154", // reuse NATIVE ADVANCED
+  stickyBanner: "ca-app-pub-2928763177849470/3098755174", // STICKY BANNER
 } as const;
 
 export const AD_IDS = USE_TEST_ADS ? TEST_AD_IDS : LIVE_AD_IDS;

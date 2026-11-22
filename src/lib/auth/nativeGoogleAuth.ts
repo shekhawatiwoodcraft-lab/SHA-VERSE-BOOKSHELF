@@ -1,7 +1,11 @@
 import { Capacitor } from "@capacitor/core";
 import { SocialLogin } from "@capgo/capacitor-social-login";
 import { supabase } from "@/integrations/supabase/client";
-import { GOOGLE_WEB_CLIENT_ID, GOOGLE_IOS_CLIENT_ID } from "@/config/googleAuth";
+import {
+  ANDROID_PACKAGE_NAME,
+  GOOGLE_WEB_CLIENT_ID,
+  GOOGLE_IOS_CLIENT_ID,
+} from "@/config/googleAuth";
 
 let initialized = false;
 
@@ -139,7 +143,7 @@ export async function nativeGoogleSignIn(): Promise<void> {
 
   if (!idToken) {
     throw new Error(
-      "Google se idToken nahi mila. Google Cloud me Android client (package com.shaverse.app + SHA-1) aur Web client ID check karo."
+      `Google se idToken nahi mila. Google Cloud me Android client (package ${ANDROID_PACKAGE_NAME} + SHA-1) aur Web client ID check karo.`
     );
   }
 

@@ -5,6 +5,8 @@ import { useAuth } from '@/contexts/AuthContext';
 import { compressImage } from '@/lib/media/compressImage';
 import { computeExpiresAt, isStatusActive } from '@/lib/promotions/statusDuration';
 import { isSchemaMissingError } from '@/integrations/supabase/config';
+import { APP_OWNER_EMAIL, isOwnerEmail } from '@/modules/bookshelf/lib/uploadAccess';
+import { useAppOwner } from '@/hooks/useAppOwner';
 
 export interface AppPromotion {
   id: string;
@@ -53,11 +55,7 @@ async function uploadStatusMedia(userId: string, file: File, index: number): Pro
   throw lastError ?? new Error('Failed to upload status media');
 }
 
-export const APP_OWNER_EMAIL = 'shashaaiteam@gmail.com';
-
-export function isOwnerEmail(email?: string | null): boolean {
-  return (email ?? '').trim().toLowerCase() === APP_OWNER_EMAIL;
-}
+export { APP_OWNER_EMAIL, isOwnerEmail };
 
 const viewsStorageKey = (userId?: string) =>
   userId ? `sha_verse_promo_views_${userId}` : 'sha_verse_promo_views_guest';
@@ -88,32 +86,7 @@ function writeLocalViewedId(userId: string | undefined, promotionId: string) {
 export function useAppPromotions() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
-
-  const isOwnerByEmail = isOwnerEmail(user?.email);
-
-  // Check if current user is the app owner (designated owner email or admin role)
-  const { data: isAdminRole = false } = useQuery({
-    queryKey: ['app-owner-check', user?.id, user?.email],
-    queryFn: async () => {
-      if (!user) return false;
-      if (isOwnerEmail(user.email)) return true;
-
-      const { data, error } = await supabase.rpc('is_admin', { _user_id: user.id });
-      if (!error && typeof data === 'boolean') return data;
-
-      const { data: roleRow } = await supabase
-        .from('user_roles')
-        .select('role')
-        .eq('user_id', user.id)
-        .eq('role', 'admin')
-        .maybeSingle();
-      return !!roleRow;
-    },
-    enabled: !!user,
-    staleTime: 1000 * 60 * 5,
-  });
-
-  const isAppOwner = isOwnerByEmail || isAdminRole;
+  const { isAppOwner } = useAppOwner();
 
   // Fetch currently active (non-expired) status updates in chronological order
   const { data: promotions = [], isLoading } = useQuery({

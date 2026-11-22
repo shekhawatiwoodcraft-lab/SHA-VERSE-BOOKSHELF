@@ -449,3 +449,228 @@ export function validateTranslationBatch(
 
   return { valid: true, map };
 }
+
+export type TextBlock = Extract<Block, { type: "heading" | "paragraph" }>;
+
+/**
+ * Collects all translatable/narratable text blocks belonging to a specific page.
+ * Falls back gracefully around fallbackStartBlockIndex when a single page has no blocks.
+ */
+export function getPageTextBlocks(
+  book: ReflowBook,
+  targetPage: number,
+  fallbackStartBlockIndex = 0,
+  fallbackCount = 6,
+): Array<{ block: TextBlock; blockIndex: number }> {
+  const exact: Array<{ block: TextBlock; blockIndex: number }> = [];
+  for (let i = 0; i < book.blocks.length; i++) {
+    const b = book.blocks[i];
+    if ((b.type === "heading" || b.type === "paragraph") && b.page === targetPage && b.text.trim()) {
+      exact.push({ block: b, blockIndex: i });
+    }
+  }
+  if (exact.length > 0) return exact;
+
+  const start = Math.max(0, Math.min(fallbackStartBlockIndex, Math.max(0, book.blocks.length - 1)));
+  const near: Array<{ block: TextBlock; blockIndex: number }> = [];
+  for (let i = start; i < book.blocks.length && near.length < fallbackCount; i++) {
+    const b = book.blocks[i];
+    if ((b.type === "heading" || b.type === "paragraph") && b.text.trim()) {
+      near.push({ block: b, blockIndex: i });
+    }
+  }
+  if (near.length > 0) return near;
+
+  for (let i = 0; i < book.blocks.length && near.length < fallbackCount; i++) {
+    const b = book.blocks[i];
+    if ((b.type === "heading" || b.type === "paragraph") && b.text.trim()) {
+      near.push({ block: b, blockIndex: i });
+    }
+  }
+  return near;
+}
+
+/**
+ * Builds AudioSegments strictly for the requested reading page (Page Audio level).
+ */
+export function buildPageAudioSegments(params: {
+  bookId: string;
+  book: ReflowBook;
+  page: number;
+  language: string;
+  voiceId: string;
+  style: string;
+  translatedMap?: Record<string, string>;
+  fallbackStartBlockIndex?: number;
+  maxCharsPerSegment?: number;
+}): AudioSegment[] {
+  const {
+    bookId,
+    book,
+    page,
+    language,
+    voiceId,
+    style,
+    translatedMap,
+    fallbackStartBlockIndex = 0,
+    maxCharsPerSegment = 850,
+  } = params;
+
+  const pageBlocks = getPageTextBlocks(book, page, fallbackStartBlockIndex);
+  if (pageBlocks.length === 0) return [];
+
+  const chapters = resolveBookChapters(book);
+  const firstBi = pageBlocks[0].blockIndex;
+  let ownerChapter = chapters[0] ?? {
+    id: `page_${page}`,
+    title: `Page ${page}`,
+    blockIndex: firstBi,
+    page,
+    level: 0,
+  };
+  for (let ci = 0; ci < chapters.length; ci++) {
+    if (chapters[ci].blockIndex <= firstBi) ownerChapter = chapters[ci];
+    else break;
+  }
+
+  const out: AudioSegment[] = [];
+  for (const { block, blockIndex } of pageBlocks) {
+    const chunkSegs = buildChapterAudioSegments({
+      bookId,
+      chapter: ownerChapter,
+      blocks: book.blocks,
+      startIndex: blockIndex,
+      endIndex: blockIndex + 1,
+      language,
+      voiceId,
+      style,
+      translatedMap,
+      mode: "paragraph",
+      maxCharsPerSegment,
+    });
+    out.push(...chunkSegs);
+  }
+  return out;
+}
+
+/**
+ * Builds AudioSegments for arbitrary highlighted/selected text (Selected Text Audio level).
+ */
+export function buildSelectionAudioSegments(params: {
+  bookId: string;
+  text: string;
+  language: string;
+  voiceId: string;
+  style: string;
+  blockId?: string;
+  blockIndex?: number;
+  chapterId?: string;
+  chapterTitle?: string;
+  page?: number;
+  maxCharsPerSegment?: number;
+}): AudioSegment[] {
+  const clean = (params.text || "").trim();
+  if (!clean) return [];
+
+  const maxChars = params.maxCharsPerSegment ?? 850;
+  const sentences = splitIntoSentences(clean);
+  const baseSpans = sentences.length
+    ? sentences
+    : [{ index: 0, start: 0, end: clean.length, text: clean }];
+
+  const chunks: Array<{ index: number; start: number; end: number; text: string }> = [];
+  if (clean.length <= maxChars) {
+    chunks.push({ index: 0, start: 0, end: clean.length, text: clean });
+  } else {
+    let accTexts: string[] = [];
+    let accStart = baseSpans[0].start;
+    let accEnd = baseSpans[0].end;
+    let accLen = 0;
+    for (const s of baseSpans) {
+      const addedLen = (accTexts.length > 0 ? 1 : 0) + s.text.length;
+      if (accTexts.length > 0 && accLen + addedLen > maxChars) {
+        chunks.push({ index: chunks.length, start: accStart, end: accEnd, text: accTexts.join(" ") });
+        accTexts = [s.text];
+        accStart = s.start;
+        accEnd = s.end;
+        accLen = s.text.length;
+      } else {
+        if (accTexts.length === 0) accStart = s.start;
+        accTexts.push(s.text);
+        accEnd = s.end;
+        accLen += addedLen;
+      }
+    }
+    if (accTexts.length > 0) {
+      chunks.push({ index: chunks.length, start: accStart, end: accEnd, text: accTexts.join(" ") });
+    }
+  }
+
+  return chunks.map((c) => {
+    const contentHash = hashTextContent(
+      `sel:${params.bookId}:${c.index}:${params.language}:${params.voiceId}:${params.style}:${c.text}`,
+    );
+    return {
+      id: `sel_${c.index}_${contentHash.slice(0, 8)}`,
+      bookId: params.bookId,
+      chapterId: params.chapterId || "selection",
+      chapterTitle: params.chapterTitle || "Selected Text",
+      blockId: params.blockId || "selection",
+      blockIndex: params.blockIndex ?? 0,
+      sentenceIndex: c.index,
+      sentenceCount: chunks.length,
+      charStart: c.start,
+      charEnd: c.end,
+      page: params.page ?? 1,
+      text: c.text,
+      language: params.language,
+      voiceId: params.voiceId,
+      style: params.style,
+      contentHash,
+      hasDialogue: detectDialogueParts(c.text).some((p) => p.speaker === "Speaker"),
+    };
+  });
+}
+
+/**
+ * Resolves exact chapterIndex and blockIndex from saved chapterId / blockId
+ * so remote listening progress restores accurately even when indices weren't stored.
+ */
+export function resolveChapterAndBlockIndex(
+  book: ReflowBook,
+  chapters: Chapter[],
+  chapterId?: string,
+  blockId?: string,
+  fallbackChapterIndex = 0,
+): { chapterIndex: number; blockIndex: number } {
+  let blockIndex = -1;
+  if (blockId) {
+    blockIndex = book.blocks.findIndex((b) => b.id === blockId);
+  }
+
+  let chapterIndex = -1;
+  if (blockIndex >= 0) {
+    for (let i = 0; i < chapters.length; i++) {
+      const next = chapters[i + 1];
+      if (!next || blockIndex < next.blockIndex) {
+        chapterIndex = i;
+        break;
+      }
+    }
+  }
+
+  if (chapterIndex < 0 && chapterId) {
+    chapterIndex = chapters.findIndex((c) => c.id === chapterId);
+  }
+
+  if (chapterIndex < 0) {
+    chapterIndex = Math.max(0, Math.min(fallbackChapterIndex, Math.max(0, chapters.length - 1)));
+  }
+
+  if (blockIndex < 0) {
+    blockIndex = chapters[chapterIndex]?.blockIndex ?? 0;
+  }
+
+  return { chapterIndex, blockIndex };
+}
+

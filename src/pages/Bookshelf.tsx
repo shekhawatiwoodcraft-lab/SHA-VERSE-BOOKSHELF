@@ -5,7 +5,7 @@ import { useNavigate } from "react-router-dom";
 
 import { useQuery } from "@tanstack/react-query";
 
-import { Book, Plus, Search, TrendingUp, Clock, Users, Grid, List, BookOpen, Heart, ChevronDown, ChevronUp, X, User, LogOut, Mail, Phone, Flame, Eye, ThumbsUp, ArrowRight } from "lucide-react";
+import { Book, Plus, Search, TrendingUp, Clock, Users, Grid, List, BookOpen, Heart, ChevronDown, ChevronUp, X, User, LogOut, Mail, Phone, Flame, Eye, ThumbsUp, ArrowRight, LayoutDashboard, Settings as SettingsIcon, Shield } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 
@@ -41,6 +41,8 @@ import {
 } from "@/lib/bookshelf/trending";
 
 import { useAuth } from "@/contexts/AuthContext";
+import { useAppOwner } from "@/hooks/useAppOwner";
+import { getProfileMenuVisibility } from "@/modules/bookshelf/lib/profileMenuAccess";
 
 import { supabase } from "@/integrations/supabase/client";
 
@@ -65,6 +67,8 @@ const Bookshelf = () => {
   const navigate = useNavigate();
 
   const { user, signOut } = useAuth();
+  const { isAppOwner } = useAppOwner();
+  const profileMenu = getProfileMenuVisibility(isAppOwner);
 
 
 
@@ -351,12 +355,9 @@ const Bookshelf = () => {
 
 
 
-            <div className="flex items-center gap-3">
-
+            <div className="flex items-center gap-2 sm:gap-3">
               {userChannel ? (
-
                 <>
-
                   <Button
                     onClick={() => setShowUploadDialog(true)}
                     size="icon"
@@ -367,8 +368,6 @@ const Bookshelf = () => {
                   >
                     <Plus className="w-5 h-5" />
                   </Button>
-
-
 
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -388,13 +387,42 @@ const Bookshelf = () => {
                       </div>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-56">
-                      <DropdownMenuItem
-                        onSelect={() => navigate(`/bookshelf/channel/${userChannel.id}`)}
-                        className="cursor-pointer"
-                      >
-                        <User className="w-4 h-4 mr-2" />
-                        Your Channel
-                      </DropdownMenuItem>
+                      {profileMenu.showYourChannel && (
+                        <DropdownMenuItem
+                          onSelect={() => navigate(`/bookshelf/channel/${userChannel.id}`)}
+                          className="cursor-pointer"
+                        >
+                          <User className="w-4 h-4 mr-2" />
+                          Your Channel
+                        </DropdownMenuItem>
+                      )}
+                      {profileMenu.showLibraryWorkspace && (
+                        <DropdownMenuItem
+                          onSelect={() => navigate("/dashboard")}
+                          className="cursor-pointer"
+                        >
+                          <LayoutDashboard className="w-4 h-4 mr-2" />
+                          Library Workspace
+                        </DropdownMenuItem>
+                      )}
+                      {profileMenu.showAccountSettings && (
+                        <DropdownMenuItem
+                          onSelect={() => navigate("/settings")}
+                          className="cursor-pointer"
+                        >
+                          <SettingsIcon className="w-4 h-4 mr-2" />
+                          Account &amp; Settings
+                        </DropdownMenuItem>
+                      )}
+                      {profileMenu.showAdminPanel && (
+                        <DropdownMenuItem
+                          onSelect={() => navigate("/admin")}
+                          className="cursor-pointer"
+                        >
+                          <Shield className="w-4 h-4 mr-2 text-primary" />
+                          Admin Panel
+                        </DropdownMenuItem>
+                      )}
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         onSelect={() => void signOut()}
@@ -423,21 +451,26 @@ const Bookshelf = () => {
                       )}
                     </DropdownMenuContent>
                   </DropdownMenu>
-
                 </>
-
               ) : (
-
-                <Button onClick={() => setShowCreateChannelDialog(true)} size="sm" className="bg-gradient-primary text-white border-0">
-
-                  <Plus className="w-4 h-4 mr-1" />
-
-                  Become an Author
-
-                </Button>
-
+                <>
+                  {profileMenu.showAccountSettings && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => navigate("/settings")}
+                      aria-label="Account Settings"
+                      title="Account Settings"
+                    >
+                      <SettingsIcon className="w-4 h-4" />
+                    </Button>
+                  )}
+                  <Button onClick={() => setShowCreateChannelDialog(true)} size="sm" className="bg-gradient-primary text-white border-0">
+                    <Plus className="w-4 h-4 mr-1" />
+                    Become an Author
+                  </Button>
+                </>
               )}
-
             </div>
 
           </div>

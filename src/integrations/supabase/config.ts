@@ -2,6 +2,7 @@ export const LEGACY_DISCONNECTED_PROJECT_REF = "plmhjuqedtkiffzhberf";
 
 export const DEFAULT_SUPABASE_URL = "https://gkmyhgebjqkdvjzgbrhr.supabase.co";
 export const DEFAULT_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_rgJcImQqgXg8NJMKRqvFyg_y7g1jXfE";
+export const DEFAULT_SUPABASE_JWKS_URL = `${DEFAULT_SUPABASE_URL}/auth/v1/.well-known/jwks.json`;
 
 /**
  * Normalizes a Supabase project URL by stripping trailing slashes or accidental
@@ -25,7 +26,8 @@ export function normalizeSupabaseUrl(rawUrl?: string | null): string {
 export function resolveSupabaseConfig(env?: {
   url?: string | null;
   key?: string | null;
-}): { url: string; publishableKey: string; projectRef: string } {
+  jwksUrl?: string | null;
+}): { url: string; publishableKey: string; projectRef: string; jwksUrl: string } {
   const normalizedEnvUrl = normalizeSupabaseUrl(env?.url);
   const url = normalizedEnvUrl || DEFAULT_SUPABASE_URL;
 
@@ -36,7 +38,13 @@ export function resolveSupabaseConfig(env?: {
   const refMatch = /^https?:\/\/([a-z0-9-]+)\.supabase\.co/i.exec(url);
   const projectRef = refMatch?.[1] || "";
 
-  return { url, publishableKey, projectRef };
+  const rawJwks = (env?.jwksUrl || "").trim();
+  const jwksUrl =
+    rawJwks && !rawJwks.toLowerCase().includes(LEGACY_DISCONNECTED_PROJECT_REF)
+      ? rawJwks
+      : `${url}/auth/v1/.well-known/jwks.json`;
+
+  return { url, publishableKey, projectRef, jwksUrl };
 }
 
 export const SCHEMA_SETUP_HINT =
@@ -50,11 +58,18 @@ export function isSchemaMissingError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const err = error as { code?: unknown; message?: unknown; status?: unknown };
   const code = typeof err.code === "string" ? err.code.toUpperCase() : "";
-  if (code === "PGRST205" || code === "PGRST202" || code === "42P01") {
+  if (
+    code === "PGRST205" ||
+    code === "PGRST204" ||
+    code === "PGRST202" ||
+    code === "42P01" ||
+    code === "42703" ||
+    code === "42883"
+  ) {
     return true;
   }
   const msg = typeof err.message === "string" ? err.message : "";
-  return /could not find the (?:table|function).*in the schema cache|relation .* does not exist/i.test(msg);
+  return /could not find the (?:table|column|function).*in the schema cache|(?:relation|column|function) .* does not exist/i.test(msg);
 }
 
 /**

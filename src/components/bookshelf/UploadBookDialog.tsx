@@ -37,6 +37,7 @@ import {
 } from "@/components/ui/command";
 import { cn } from "@/lib/utils";
 import { useBooks } from "@/hooks/useBooks";
+import { useAppOwner } from "@/hooks/useAppOwner";
 import { BOOK_CATEGORIES, type BookCategory } from "@/lib/constants/bookshelf";
 import { WORLD_LANGUAGES } from "@/lib/constants/languages";
 import { toast } from "sonner";
@@ -47,6 +48,10 @@ import {
   parseTitleAndAuthorFromFilename,
   validateBulkFileSelection,
 } from "@/modules/bookshelf/lib/bookMetadataHeuristics";
+import {
+  resolveEffectiveUploadMode,
+  type UploadMode,
+} from "@/modules/bookshelf/lib/uploadAccess";
 import BulkBookItemCard, { type BulkBookQueueItem } from "./BulkBookItemCard";
 
 interface UploadBookDialogProps {
@@ -54,8 +59,6 @@ interface UploadBookDialogProps {
   onOpenChange: (open: boolean) => void;
   channelId: string;
 }
-
-type UploadMode = "single" | "bulk";
 
 const UNIQUE_WORLD_LANGUAGES = Array.from(new Set(WORLD_LANGUAGES));
 
@@ -65,8 +68,10 @@ const UploadBookDialog = ({
   channelId,
 }: UploadBookDialogProps) => {
   const { uploadBook } = useBooks();
+  const { isAppOwner } = useAppOwner();
 
-  const [mode, setMode] = useState<UploadMode>("single");
+  const [requestedMode, setRequestedMode] = useState<UploadMode>("single");
+  const mode = resolveEffectiveUploadMode(requestedMode, isAppOwner);
 
   // ----------------------------- Single Mode State -----------------------------
   const [title, setTitle] = useState("");
@@ -121,6 +126,21 @@ const UploadBookDialog = ({
   }, [isBusy, onOpenChange]);
 
   useRegisterBackOverlay(open, "upload-book-dialog", handleClose);
+
+  // If user is not the app owner, lock mode to single and clear any stale bulk queue
+  useEffect(() => {
+    if (!isAppOwner) {
+      if (requestedMode !== "single") {
+        setRequestedMode("single");
+      }
+      if (bulkQueueRef.current.length > 0) {
+        for (const item of bulkQueueRef.current) {
+          if (item.coverPreviewUrl) URL.revokeObjectURL(item.coverPreviewUrl);
+        }
+        setBulkQueue([]);
+      }
+    }
+  }, [isAppOwner, requestedMode]);
 
   // Cleanup blob URLs when component unmounts
   useEffect(() => {
@@ -234,7 +254,11 @@ const UploadBookDialog = ({
     if (!files || files.length === 0) return;
     const picked = Array.from(files);
     if (picked.length > 1) {
-      toast.info("Single upload accepts 1 book. Switch to Bulk Upload for up to 20 books.");
+      toast.info(
+        isAppOwner
+          ? "Single upload accepts 1 book. Switch to Bulk Upload for up to 20 books."
+          : "You can upload 1 book at a time."
+      );
     }
     const validation = validateBulkFileSelection([], [picked[0]], 1);
     if (validation.accepted.length === 0) {
@@ -387,7 +411,7 @@ const UploadBookDialog = ({
   }, [bulkQueue, analyzeBulkItemById]);
 
   const handleAddBulkFiles = (files: FileList | File[] | null) => {
-    if (!files || files.length === 0) return;
+    if (!isAppOwner || !files || files.length === 0) return;
     const incoming = Array.from(files);
 
     const validation = validateBulkFileSelection(
@@ -519,7 +543,7 @@ const UploadBookDialog = ({
   }, [bulkQueue]);
 
   const handleBulkSubmit = async () => {
-    if (!channelId || bulkStats.readyCount === 0 || bulkStats.analyzing > 0) return;
+    if (!isAppOwner || !channelId || bulkStats.readyCount === 0 || bulkStats.analyzing > 0) return;
 
     const reconciled = reconcileQueueDuplicates(bulkQueue);
     setBulkQueue(reconciled);
@@ -616,47 +640,51 @@ const UploadBookDialog = ({
         {/* Sticky Full-Screen Header */}
         <DialogHeader className="px-4 sm:px-8 py-3.5 pr-14 border-b bg-background/95 backdrop-blur shrink-0 text-left">
           <div className="max-w-5xl mx-auto w-full flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <DialogTitle className="text-lg sm:text-xl font-bold">Upload Books</DialogTitle>
+            <DialogTitle className="text-lg sm:text-xl font-bold">
+              {isAppOwner ? "Upload Books" : "Upload Book"}
+            </DialogTitle>
 
-            {/* Single vs Bulk Segmented Toggle */}
-            <div
-              role="tablist"
-              aria-label="Upload mode"
-              className="inline-flex rounded-lg border bg-muted/50 p-1 self-start sm:self-auto"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mode === "single"}
-                disabled={isBusy}
-                onClick={() => setMode("single")}
-                className={cn(
-                  "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
-                  mode === "single"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
+            {/* Single vs Bulk Segmented Toggle — App Owner Only */}
+            {isAppOwner && (
+              <div
+                role="tablist"
+                aria-label="Upload mode"
+                className="inline-flex rounded-lg border bg-muted/50 p-1 self-start sm:self-auto"
               >
-                <FileText className="w-3.5 h-3.5" />
-                Single (1 Book)
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mode === "bulk"}
-                disabled={isBusy}
-                onClick={() => setMode("bulk")}
-                className={cn(
-                  "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
-                  mode === "bulk"
-                    ? "bg-background text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
-              >
-                <Layers className="w-3.5 h-3.5" />
-                Bulk (Max {MAX_BULK_BOOKS})
-              </button>
-            </div>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "single"}
+                  disabled={isBusy}
+                  onClick={() => setRequestedMode("single")}
+                  className={cn(
+                    "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
+                    mode === "single"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  Single (1 Book)
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === "bulk"}
+                  disabled={isBusy}
+                  onClick={() => setRequestedMode("bulk")}
+                  className={cn(
+                    "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
+                    mode === "bulk"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  Bulk (Max {MAX_BULK_BOOKS})
+                </button>
+              </div>
+            )}
           </div>
         </DialogHeader>
 

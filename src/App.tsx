@@ -49,6 +49,9 @@ const EditAuthorChannel = lazy(() => import("./pages/EditAuthorChannel"));
 const ChannelAnalytics = lazy(() => import("./pages/ChannelAnalytics"));
 const BookAnalytics = lazy(() => import("./pages/BookAnalytics"));
 const Auth = lazy(() => import("./pages/Auth"));
+const LibraryDashboard = lazy(() => import("./pages/LibraryDashboard"));
+const Settings = lazy(() => import("./pages/Settings"));
+const AdminPanel = lazy(() => import("./pages/AdminPanel"));
 const OfflinePage = lazy(() => import("./pages/Offline"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 
@@ -105,7 +108,7 @@ const ResponsiveSonner = () => {
 };
 
 const App = () => (
-  <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
+  <ThemeProvider attribute="class" defaultTheme="light" enableSystem={true} disableTransitionOnChange>
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <Toaster />
@@ -156,6 +159,18 @@ const App = () => (
                       <Route
                         path="/bookshelf/channel/:channelId/edit"
                         element={<ProtectedRoute>{withSuspense(EditAuthorChannel)}</ProtectedRoute>}
+                      />
+                      <Route
+                        path="/dashboard"
+                        element={<ProtectedRoute>{withSuspense(LibraryDashboard)}</ProtectedRoute>}
+                      />
+                      <Route
+                        path="/settings"
+                        element={<ProtectedRoute>{withSuspense(Settings)}</ProtectedRoute>}
+                      />
+                      <Route
+                        path="/admin"
+                        element={<ProtectedRoute>{withSuspense(AdminPanel)}</ProtectedRoute>}
                       />
                       <Route path="*" element={withSuspense(NotFound)} />
                     </Routes>

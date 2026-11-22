@@ -24,7 +24,7 @@ export const GOOGLE_WEB_CLIENT_ID =
  * Ye plugin ko PASS NAHI hota (aur karna bhi nahi chahiye).
  *
  * Google Cloud → Credentials → "Sha-Verse Android"
- *   Package name : com.shaverse.app
+ *   Package name : com.shaverse.bookshelf
  *   SHA-1        : GOOGLE_ANDROID_SHA1 (neeche)
  */
 export const GOOGLE_ANDROID_CLIENT_ID =
@@ -34,8 +34,8 @@ export const GOOGLE_ANDROID_CLIENT_ID =
 export const GOOGLE_ANDROID_SHA1 =
   "EE:68:B0:33:BA:C6:B6:C9:46:59:68:DA:9A:9E:1B:E1:69:77:32:C1";
 
-/** Android package name (AndroidManifest.xml ka `package` / appId). */
-export const ANDROID_PACKAGE_NAME = "com.shaverse.app";
+/** Android package name / applicationId (AndroidManifest.xml / build.gradle / capacitor.config.ts). */
+export const ANDROID_PACKAGE_NAME = "com.shaverse.bookshelf";
 
 /**
  * iOS client ID (sirf tab chahiye jab iOS native build banao).

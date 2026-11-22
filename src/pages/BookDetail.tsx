@@ -392,7 +392,7 @@ const BookDetail = () => {
                     <Edit className="w-4 h-4 mr-2" /> Edit Book
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => setShowDeletionDialog(true)} className="text-destructive">
-                    <Trash2 className="w-4 h-4 mr-2" /> Request Deletion
+                    <Trash2 className="w-4 h-4 mr-2" /> Delete Book
                   </DropdownMenuItem>
                 </>
               )}
@@ -776,6 +776,7 @@ const BookDetail = () => {
         onOpenChange={setShowDeletionDialog}
         bookId={bookId!}
         bookTitle={book.title}
+        onDeleted={() => navigate("/bookshelf", { replace: true })}
       />
 
       <BookReportDialog

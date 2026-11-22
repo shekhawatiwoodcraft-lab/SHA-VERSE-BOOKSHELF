@@ -40,6 +40,8 @@ export interface ListeningProgressRecord {
   updatedAt: number;
 }
 
+export type AudioEnginePreference = "auto" | "browser" | "ai";
+
 export interface UserVoicePreferences {
   preferredTargetLanguage: string;
   preferredTtsLanguage: string;
@@ -49,6 +51,8 @@ export interface UserVoicePreferences {
   preferredSpeed: number;
   dialogueMode: boolean;
   sleepTimerMinutes: number; // 0 = off, -1 = end of chapter
+  preferredAudioEngine: AudioEnginePreference;
+  preferredBrowserVoiceUri?: string;
 }
 
 export const DEFAULT_VOICE_PREFERENCES: UserVoicePreferences = {
@@ -60,6 +64,8 @@ export const DEFAULT_VOICE_PREFERENCES: UserVoicePreferences = {
   preferredSpeed: 1.0,
   dialogueMode: false,
   sleepTimerMinutes: 0,
+  preferredAudioEngine: "auto",
+  preferredBrowserVoiceUri: undefined,
 };
 
 const TRANSLATION_PREFIX = "shaverse:ai:translation:v1:";

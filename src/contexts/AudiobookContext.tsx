@@ -10,24 +10,34 @@ import React, {
 import type { Chapter, ReflowBook } from "@/lib/reader/types";
 import {
   buildChapterAudioSegments,
+  buildPageAudioSegments,
+  buildSelectionAudioSegments,
   getChapterBlockRange,
   resolveBookChapters,
+  resolveChapterAndBlockIndex,
   type AudioSegment,
 } from "@/lib/ai/segments";
 import {
-  DEFAULT_VOICE_PREFERENCES,
   loadCachedAudioSegment,
   loadVoicePreferencesSync,
   saveCachedAudioSegment,
   saveListeningProgress,
   saveVoicePreferencesSync,
+  type AudioEnginePreference,
   type ListeningProgressRecord,
   type UserVoicePreferences,
 } from "@/lib/ai/cache";
 import { AiServiceError, generateSpeechWav } from "@/lib/ai/client";
 import type { GeminiPrebuiltVoiceId, NarrationStyleId } from "@/lib/ai/languages";
+import {
+  isWebSpeechSupported,
+  listBrowserVoicesForLanguage,
+  WebSpeechController,
+  type BrowserVoiceInfo,
+} from "@/lib/ai/webSpeechTts";
 
 export type AudiobookStatus = "idle" | "loading" | "playing" | "paused" | "error";
+export type AudiobookScope = "selection" | "paragraph" | "page" | "chapter" | "book";
 
 export interface AudiobookStartInput {
   bookId: string;
@@ -38,9 +48,39 @@ export interface AudiobookStartInput {
   language: string;
   translatedMap?: Record<string, string>;
   chapterIndex?: number;
+  chapterId?: string;
   startBlockId?: string;
   startSentenceIndex?: number;
   startPositionSec?: number;
+  scope?: AudiobookScope;
+  page?: number;
+}
+
+export interface SelectionPlaybackInput {
+  bookId: string;
+  bookTitle: string;
+  author?: string;
+  coverUrl?: string | null;
+  reflowBook: ReflowBook;
+  text: string;
+  language: string;
+  blockId?: string;
+  blockIndex?: number;
+  chapterId?: string;
+  chapterTitle?: string;
+  page?: number;
+}
+
+export interface PagePlaybackInput {
+  bookId: string;
+  bookTitle: string;
+  author?: string;
+  coverUrl?: string | null;
+  reflowBook: ReflowBook;
+  page: number;
+  language: string;
+  translatedMap?: Record<string, string>;
+  fallbackStartBlockIndex?: number;
 }
 
 export interface AudiobookSession {
@@ -51,6 +91,8 @@ export interface AudiobookSession {
   reflowBook: ReflowBook;
   chapters: Chapter[];
   currentChapterIndex: number;
+  currentPage: number;
+  scope: AudiobookScope;
   language: string;
   translatedMap?: Record<string, string>;
   segments: AudioSegment[];
@@ -60,6 +102,8 @@ export interface AudiobookSession {
 interface AudiobookContextValue {
   session: AudiobookSession | null;
   status: AudiobookStatus;
+  activeEngine: "ai" | "browser";
+  availableBrowserVoices: BrowserVoiceInfo[];
   error: string | null;
   errorCode: string | null;
   preferences: UserVoicePreferences;
@@ -71,6 +115,8 @@ interface AudiobookContextValue {
   sleepRemainingSec: number | null;
   activeSegment: AudioSegment | null;
   startBookPlayback: (input: AudiobookStartInput) => Promise<void>;
+  startPagePlayback: (input: PagePlaybackInput) => Promise<void>;
+  startSelectionPlayback: (input: SelectionPlaybackInput) => Promise<void>;
   unlockAudio: () => void;
   togglePlayPause: () => void;
   pausePlayback: () => void;
@@ -78,6 +124,8 @@ interface AudiobookContextValue {
   stopPlayback: () => void;
   nextSegment: () => void;
   prevSegment: () => void;
+  nextPageAudio: () => void;
+  prevPageAudio: () => void;
   nextChapter: () => void;
   prevChapter: () => void;
   seekDeltaSeconds: (delta: number) => void;
@@ -86,6 +134,8 @@ interface AudiobookContextValue {
   jumpToBlockSentence: (blockId: string, sentenceIndex?: number) => Promise<void>;
   updatePreferences: (patch: Partial<UserVoicePreferences>) => void;
   setVoiceAndApply: (voiceId: GeminiPrebuiltVoiceId) => void;
+  setBrowserVoiceAndApply: (voiceURI: string) => void;
+  setAudioEngineAndApply: (engine: AudioEnginePreference) => void;
   setStyleAndApply: (style: NarrationStyleId) => void;
   setSpeed: (speed: number) => void;
   setVolume: (vol: number) => void;
@@ -105,6 +155,8 @@ const AudiobookContext = createContext<AudiobookContextValue | null>(null);
 export function AudiobookProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<AudiobookSession | null>(null);
   const [status, setStatus] = useState<AudiobookStatus>("idle");
+  const [activeEngine, setActiveEngine] = useState<"ai" | "browser">("ai");
+  const [availableBrowserVoices, setAvailableBrowserVoices] = useState<BrowserVoiceInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [preferences, setPreferences] = useState<UserVoicePreferences>(loadVoicePreferencesSync);
@@ -116,19 +168,47 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
   const [sleepRemainingSec, setSleepRemainingSec] = useState<number | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const webSpeechRef = useRef<WebSpeechController | null>(null);
   const currentObjectUrlRef = useRef<string | null>(null);
   const inflightFetchRef = useRef<Map<string, Promise<Blob>>>(new Map());
   const abortControllerRef = useRef<AbortController | null>(null);
   const sessionRef = useRef<AudiobookSession | null>(null);
   const prefsRef = useRef<UserVoicePreferences>(preferences);
   const statusRef = useRef<AudiobookStatus>(status);
+  const activeEngineRef = useRef<"ai" | "browser">(activeEngine);
   const sleepTimerModeRef = useRef<number>(preferences.sleepTimerMinutes);
   const lastSavedListenAtRef = useRef<number>(0);
   const preloadCooldownUntilRef = useRef<number>(0);
+  const aiTtsCooldownUntilRef = useRef<number>(0);
+  const volumeRef = useRef<number>(volume);
 
   sessionRef.current = session;
   prefsRef.current = preferences;
   statusRef.current = status;
+  activeEngineRef.current = activeEngine;
+  volumeRef.current = volume;
+
+  const ensureWebSpeech = useCallback(() => {
+    if (!webSpeechRef.current) {
+      webSpeechRef.current = new WebSpeechController();
+    }
+    return webSpeechRef.current;
+  }, []);
+
+  // Sync device voices list whenever browser populates speechSynthesis.getVoices()
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const syncVoices = () => {
+      const { all } = listBrowserVoicesForLanguage(sessionRef.current?.language || prefsRef.current.preferredTtsLanguage || "en");
+      setAvailableBrowserVoices(all);
+    };
+    syncVoices();
+    const synth = window.speechSynthesis;
+    synth.addEventListener?.("voiceschanged", syncVoices);
+    return () => {
+      synth.removeEventListener?.("voiceschanged", syncVoices);
+    };
+  }, []);
 
   const ensureAudioElement = useCallback(() => {
     if (typeof window === "undefined") return null;
@@ -140,10 +220,6 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     return audioRef.current;
   }, []);
 
-  /**
-   * Synchronously primes the shared HTMLAudioElement inside a user click gesture
-   * so asynchronous TTS blob arrival never triggers browser NotAllowedError.
-   */
   const unlockAudio = useCallback(() => {
     const audio = ensureAudioElement();
     if (!audio) return;
@@ -175,7 +251,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const persistProgressNow = useCallback((sess: AudiobookSession | null, posSec = 0) => {
-    if (!sess) return;
+    if (!sess || sess.scope === "selection") return;
     const seg = sess.segments[sess.currentSegmentIndex];
     const chap = sess.chapters[sess.currentChapterIndex];
     if (!seg || !chap) return;
@@ -220,7 +296,13 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         })
         .catch((err) => {
           if (err instanceof AiServiceError && (err.status === 429 || err.code === "RATE_LIMITED")) {
-            preloadCooldownUntilRef.current = Date.now() + 20_000;
+            preloadCooldownUntilRef.current = Date.now() + 25_000;
+            aiTtsCooldownUntilRef.current = Date.now() + 45_000;
+          } else if (
+            err instanceof AiServiceError &&
+            (err.code === "AI_NOT_CONFIGURED" || err.code === "API_KEY_INVALID" || err.code === "MODEL_NOT_FOUND" || err.status === 401 || err.status === 403 || err.status >= 500)
+          ) {
+            aiTtsCooldownUntilRef.current = Date.now() + 90_000;
           }
           throw err;
         })
@@ -236,28 +318,79 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
 
   const preloadNextSegments = useCallback(
     (sess: AudiobookSession, fromIndex: number, prefs: UserVoicePreferences) => {
+      if (prefs.preferredAudioEngine === "browser" || activeEngineRef.current === "browser") return;
+      if (Date.now() < preloadCooldownUntilRef.current || Date.now() < aiTtsCooldownUntilRef.current) return;
       const nextSeg = sess.segments[fromIndex + 1];
       if (!nextSeg) return;
-      if (Date.now() < preloadCooldownUntilRef.current) return;
       window.setTimeout(() => {
-        if (Date.now() < preloadCooldownUntilRef.current) return;
+        if (Date.now() < preloadCooldownUntilRef.current || Date.now() < aiTtsCooldownUntilRef.current) return;
         if (statusRef.current !== "playing" && statusRef.current !== "loading") return;
         void loadCachedAudioSegment(nextSeg.contentHash).then((hit) => {
           if (!hit) {
             void fetchAudioBlob(nextSeg, prefs).catch(() => {
-              /* preload failures handled gently when active */
+              /* handled silently */
             });
           }
         });
-      }, 1200);
+      }, 900);
     },
     [fetchAudioBlob],
+  );
+
+  const handleSegmentEndedRef = useRef<() => void>(() => {});
+
+  const playSegmentWithWebSpeech = useCallback(
+    async (updatedSession: AudiobookSession, seg: AudioSegment, controller: AbortController) => {
+      const ws = ensureWebSpeech();
+      if (!isWebSpeechSupported()) {
+        throw new Error("Audio narration is unavailable: neither Studio TTS nor device speech synthesis is supported in this browser.");
+      }
+
+      const prefs = prefsRef.current;
+      activeEngineRef.current = "browser";
+      setActiveEngine("browser");
+      setStatus("playing");
+      setError(null);
+      setErrorCode(null);
+
+      persistProgressNow(updatedSession, 0);
+
+      await ws.speak({
+        text: seg.text,
+        language: seg.language,
+        rate: prefs.preferredSpeed || 1,
+        volume: volumeRef.current,
+        preferredVoiceUri: prefs.preferredBrowserVoiceUri,
+        onStart: (estTotal) => {
+          if (controller.signal.aborted) return;
+          setDuration(estTotal);
+          setCurrentTime(0);
+          setStatus("playing");
+        },
+        onProgress: (elapsed, total) => {
+          if (controller.signal.aborted) return;
+          setCurrentTime(elapsed);
+          setDuration(total);
+        },
+        onEnded: () => {
+          if (controller.signal.aborted) return;
+          handleSegmentEndedRef.current();
+        },
+        onError: (msg) => {
+          if (controller.signal.aborted) return;
+          setError(msg);
+          setErrorCode("BROWSER_TTS_ERROR");
+          setStatus("error");
+        },
+      });
+    },
+    [ensureWebSpeech, persistProgressNow],
   );
 
   const playSegmentAt = useCallback(
     async (targetSession: AudiobookSession, segIndex: number, startSec = 0) => {
       const audio = ensureAudioElement();
-      if (!audio) return;
+      const ws = ensureWebSpeech();
 
       const seg = targetSession.segments[segIndex];
       if (!seg) return;
@@ -266,8 +399,15 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       const controller = new AbortController();
       abortControllerRef.current = controller;
 
+      // Stop any active audio across both engines cleanly
+      ws.cancel();
+      if (audio) {
+        audio.pause();
+      }
+
       const updatedSession: AudiobookSession = {
         ...targetSession,
+        currentPage: seg.page || targetSession.currentPage,
         currentSegmentIndex: segIndex,
       };
       sessionRef.current = updatedSession;
@@ -278,18 +418,37 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       setCurrentTime(0);
       setDuration(0);
 
+      const prefs = prefsRef.current;
+      const enginePref = prefs.preferredAudioEngine || "auto";
+      const shouldUseBrowserDirectly =
+        enginePref === "browser" ||
+        (enginePref === "auto" && Date.now() < aiTtsCooldownUntilRef.current);
+
+      if (shouldUseBrowserDirectly) {
+        try {
+          await playSegmentWithWebSpeech(updatedSession, seg, controller);
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          setError(err instanceof Error ? err.message : "Device voice playback failed.");
+          setErrorCode("TTS_FAILED");
+          setStatus("error");
+        }
+        return;
+      }
+
       try {
-        const prefs = prefsRef.current;
+        if (!audio) {
+          throw new Error("HTMLAudioElement unavailable.");
+        }
         const blob = await fetchAudioBlob(seg, prefs, controller.signal);
         if (controller.signal.aborted) return;
 
-        audio.pause();
         revokeCurrentUrl();
         const url = URL.createObjectURL(blob);
         currentObjectUrlRef.current = url;
 
         audio.src = url;
-        audio.volume = volume;
+        audio.volume = volumeRef.current;
         audio.playbackRate = prefs.preferredSpeed || 1;
 
         if (audio.readyState < 2) {
@@ -330,6 +489,9 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         }
 
         if (controller.signal.aborted) return;
+        activeEngineRef.current = "ai";
+        setActiveEngine("ai");
+
         try {
           await audio.play();
           setStatus("playing");
@@ -345,7 +507,26 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         persistProgressNow(updatedSession, audio.currentTime);
         preloadNextSegments(updatedSession, segIndex, prefs);
       } catch (err) {
-        if ((err as { name?: string })?.name === "AbortError") return;
+        if ((err as { name?: string })?.name === "AbortError" || controller.signal.aborted) return;
+
+        // Automatic Free Device Voice fallback whenever enginePref === "auto"
+        if (enginePref === "auto" && isWebSpeechSupported()) {
+          try {
+            await playSegmentWithWebSpeech(updatedSession, seg, controller);
+            return;
+          } catch (fallbackErr) {
+            if (controller.signal.aborted) return;
+            setError(
+              fallbackErr instanceof Error
+                ? fallbackErr.message
+                : "Could not play audio with AI or device voice.",
+            );
+            setErrorCode("TTS_FAILED");
+            setStatus("error");
+            return;
+          }
+        }
+
         const message =
           err instanceof Error ? err.message : "Failed to generate narration audio for this segment.";
         const code = err instanceof AiServiceError ? err.code : "TTS_FAILED";
@@ -354,7 +535,15 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         setStatus("error");
       }
     },
-    [ensureAudioElement, fetchAudioBlob, persistProgressNow, preloadNextSegments, revokeCurrentUrl, volume],
+    [
+      ensureAudioElement,
+      ensureWebSpeech,
+      fetchAudioBlob,
+      persistProgressNow,
+      playSegmentWithWebSpeech,
+      preloadNextSegments,
+      revokeCurrentUrl,
+    ],
   );
 
   const buildSegmentsForChapter = useCallback(
@@ -402,26 +591,18 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       }
 
       const prefs = prefsRef.current;
-      let targetChapIdx = Math.max(0, Math.min(input.chapterIndex ?? 0, chapters.length - 1));
-
-      // If starting at a specific blockId, resolve chapter index containing that blockId
-      if (input.startBlockId) {
-        const blockIdx = input.reflowBook.blocks.findIndex((b) => b.id === input.startBlockId);
-        if (blockIdx >= 0) {
-          for (let ci = 0; ci < chapters.length; ci++) {
-            const nextChap = chapters[ci + 1];
-            if (!nextChap || blockIdx < nextChap.blockIndex) {
-              targetChapIdx = ci;
-              break;
-            }
-          }
-        }
-      }
+      const resolved = resolveChapterAndBlockIndex(
+        input.reflowBook,
+        chapters,
+        input.chapterId,
+        input.startBlockId,
+        input.chapterIndex ?? 0,
+      );
 
       const built = buildSegmentsForChapter(
         input.reflowBook,
         chapters,
-        targetChapIdx,
+        resolved.chapterIndex,
         input.bookId,
         input.language,
         prefs,
@@ -450,6 +631,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
+      const firstSeg = built.segments[startSegIdx] ?? built.segments[0];
       const newSession: AudiobookSession = {
         bookId: input.bookId,
         bookTitle: input.bookTitle,
@@ -458,6 +640,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         reflowBook: input.reflowBook,
         chapters,
         currentChapterIndex: built.chapterIndex,
+        currentPage: input.page ?? firstSeg?.page ?? 1,
+        scope: input.scope ?? "book",
         language: input.language,
         translatedMap: input.translatedMap,
         segments: built.segments,
@@ -469,6 +653,114 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       await playSegmentAt(newSession, startSegIdx, input.startPositionSec ?? 0);
     },
     [buildSegmentsForChapter, playSegmentAt],
+  );
+
+  const startPagePlayback = useCallback(
+    async (input: PagePlaybackInput) => {
+      const chapters = resolveBookChapters(input.reflowBook);
+      const prefs = prefsRef.current;
+      const segments = buildPageAudioSegments({
+        bookId: input.bookId,
+        book: input.reflowBook,
+        page: input.page,
+        language: input.language,
+        voiceId: prefs.preferredVoice,
+        style: prefs.preferredStyle,
+        translatedMap: input.translatedMap,
+        fallbackStartBlockIndex: input.fallbackStartBlockIndex,
+      });
+
+      if (segments.length === 0) {
+        setError(`No narratable text found on page ${input.page}.`);
+        setErrorCode("NO_NARRATABLE_TEXT");
+        setStatus("error");
+        return;
+      }
+
+      const chapIdx = Math.max(
+        0,
+        chapters.findIndex((c) => c.id === segments[0].chapterId),
+      );
+
+      const newSession: AudiobookSession = {
+        bookId: input.bookId,
+        bookTitle: input.bookTitle,
+        author: input.author,
+        coverUrl: input.coverUrl,
+        reflowBook: input.reflowBook,
+        chapters: chapters.length
+          ? chapters
+          : [{ id: `page_${input.page}`, title: `Page ${input.page}`, blockIndex: 0, page: input.page, level: 0 }],
+        currentChapterIndex: chapIdx,
+        currentPage: input.page,
+        scope: "page",
+        language: input.language,
+        translatedMap: input.translatedMap,
+        segments,
+        currentSegmentIndex: 0,
+      };
+
+      setDrawerOpen(true);
+      setIsMinimized(false);
+      await playSegmentAt(newSession, 0, 0);
+    },
+    [playSegmentAt],
+  );
+
+  const startSelectionPlayback = useCallback(
+    async (input: SelectionPlaybackInput) => {
+      const chapters = resolveBookChapters(input.reflowBook);
+      const prefs = prefsRef.current;
+      const segments = buildSelectionAudioSegments({
+        bookId: input.bookId,
+        text: input.text,
+        language: input.language,
+        voiceId: prefs.preferredVoice,
+        style: prefs.preferredStyle,
+        blockId: input.blockId,
+        blockIndex: input.blockIndex,
+        chapterId: input.chapterId,
+        chapterTitle: input.chapterTitle || "Selected Text",
+        page: input.page,
+      });
+
+      if (segments.length === 0) {
+        setError("Selected text is empty.");
+        setErrorCode("NO_TEXT_CONTENT");
+        setStatus("error");
+        return;
+      }
+
+      const resolved = resolveChapterAndBlockIndex(
+        input.reflowBook,
+        chapters,
+        input.chapterId,
+        input.blockId,
+        0,
+      );
+
+      const newSession: AudiobookSession = {
+        bookId: input.bookId,
+        bookTitle: input.bookTitle,
+        author: input.author,
+        coverUrl: input.coverUrl,
+        reflowBook: input.reflowBook,
+        chapters: chapters.length
+          ? chapters
+          : [{ id: "selection", title: "Selected Text", blockIndex: 0, page: input.page ?? 1, level: 0 }],
+        currentChapterIndex: resolved.chapterIndex,
+        currentPage: input.page ?? 1,
+        scope: "selection",
+        language: input.language,
+        segments,
+        currentSegmentIndex: 0,
+      };
+
+      setDrawerOpen(true);
+      setIsMinimized(false);
+      await playSegmentAt(newSession, 0, 0);
+    },
+    [playSegmentAt],
   );
 
   const jumpToChapter = useCallback(
@@ -492,7 +784,9 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       }
       const nextSession: AudiobookSession = {
         ...sess,
+        scope: sess.scope === "selection" || sess.scope === "page" ? "chapter" : sess.scope,
         currentChapterIndex: built.chapterIndex,
+        currentPage: built.segments[0]?.page ?? sess.currentPage,
         segments: built.segments,
         currentSegmentIndex: 0,
       };
@@ -510,7 +804,14 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // End of chapter reached
+    // Selected-text or Page-only scope stops cleanly once its segments finish
+    if (sess.scope === "selection" || sess.scope === "page" || sess.scope === "chapter") {
+      setStatus("paused");
+      persistProgressNow(sess, 0);
+      return;
+    }
+
+    // Sleep timer: end of chapter
     if (sleepTimerModeRef.current === -1) {
       sleepTimerModeRef.current = 0;
       setSleepRemainingSec(null);
@@ -527,12 +828,15 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     }
   }, [jumpToChapter, persistProgressNow, playSegmentAt]);
 
-  // Attach audio element listeners once
+  handleSegmentEndedRef.current = handleSegmentEnded;
+
+  // Attach HTMLAudioElement listeners once
   useEffect(() => {
     const audio = ensureAudioElement();
     if (!audio) return;
 
     const onTimeUpdate = () => {
+      if (activeEngineRef.current !== "ai") return;
       setCurrentTime(audio.currentTime || 0);
       setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
       const now = Date.now();
@@ -542,15 +846,19 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       }
     };
     const onLoadedMeta = () => {
+      if (activeEngineRef.current !== "ai") return;
       setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
     };
     const onEnded = () => {
+      if (activeEngineRef.current !== "ai") return;
       handleSegmentEnded();
     };
     const onPlay = () => {
+      if (activeEngineRef.current !== "ai") return;
       if (statusRef.current !== "loading") setStatus("playing");
     };
     const onPause = () => {
+      if (activeEngineRef.current !== "ai") return;
       if (statusRef.current === "playing") {
         setStatus("paused");
         persistProgressNow(sessionRef.current, audio.currentTime || 0);
@@ -580,6 +888,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         if (prev === null) return null;
         if (prev <= 1) {
           audioRef.current?.pause();
+          webSpeechRef.current?.pause();
           setStatus("paused");
           return null;
         }
@@ -591,7 +900,10 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
 
   const pausePlayback = useCallback(() => {
     const audio = audioRef.current;
-    if (audio) {
+    if (activeEngineRef.current === "browser") {
+      webSpeechRef.current?.pause();
+      persistProgressNow(sessionRef.current, 0);
+    } else if (audio) {
       audio.pause();
       persistProgressNow(sessionRef.current, audio.currentTime || 0);
     }
@@ -601,8 +913,18 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
   const resumePlayback = useCallback(() => {
     const sess = sessionRef.current;
     if (!sess) return;
+    if (activeEngineRef.current === "browser") {
+      if (typeof window !== "undefined" && window.speechSynthesis?.paused) {
+        webSpeechRef.current?.resume();
+        setStatus("playing");
+      } else {
+        void playSegmentAt(sess, sess.currentSegmentIndex, 0);
+      }
+      return;
+    }
+
     const audio = audioRef.current;
-    if (audio && audio.src) {
+    if (audio && audio.src && !audio.ended) {
       audio.playbackRate = prefsRef.current.preferredSpeed || 1;
       void audio
         .play()
@@ -620,6 +942,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
 
   const stopPlayback = useCallback(() => {
     abortControllerRef.current?.abort();
+    webSpeechRef.current?.cancel();
     const audio = audioRef.current;
     if (audio) {
       persistProgressNow(sessionRef.current, audio.currentTime || 0);
@@ -659,6 +982,67 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     }
   }, [jumpToChapter, playSegmentAt]);
 
+  const movePageAudio = useCallback(
+    (delta: 1 | -1) => {
+      const sess = sessionRef.current;
+      if (!sess) return;
+      const totalPages = Math.max(1, sess.reflowBook.meta.totalPages || 1);
+      const currSeg = sess.segments[sess.currentSegmentIndex];
+      const basePage = currSeg?.page || sess.currentPage || 1;
+      const targetPage = Math.max(1, Math.min(totalPages, basePage + delta));
+      if (targetPage === basePage) return;
+
+      if (sess.scope === "page") {
+        void startPagePlayback({
+          bookId: sess.bookId,
+          bookTitle: sess.bookTitle,
+          author: sess.author,
+          coverUrl: sess.coverUrl,
+          reflowBook: sess.reflowBook,
+          page: targetPage,
+          language: sess.language,
+          translatedMap: sess.translatedMap,
+        });
+        return;
+      }
+
+      // In chapter/book scope, jump directly to first block on targetPage
+      const matchBlock = sess.reflowBook.blocks.find(
+        (b) => (b.type === "paragraph" || b.type === "heading") && b.page >= targetPage && b.text.trim(),
+      );
+      if (!matchBlock) return;
+      const inCurrent = sess.segments.findIndex((s) => s.blockId === matchBlock.id);
+      if (inCurrent >= 0) {
+        void playSegmentAt(sess, inCurrent, 0);
+      } else {
+        const resolved = resolveChapterAndBlockIndex(sess.reflowBook, sess.chapters, undefined, matchBlock.id);
+        const built = buildSegmentsForChapter(
+          sess.reflowBook,
+          sess.chapters,
+          resolved.chapterIndex,
+          sess.bookId,
+          sess.language,
+          prefsRef.current,
+          sess.translatedMap,
+        );
+        if (!built.segments.length) return;
+        const idx = Math.max(0, built.segments.findIndex((s) => s.blockId === matchBlock.id));
+        const nextSess: AudiobookSession = {
+          ...sess,
+          currentChapterIndex: built.chapterIndex,
+          currentPage: targetPage,
+          segments: built.segments,
+          currentSegmentIndex: idx,
+        };
+        void playSegmentAt(nextSess, idx, 0);
+      }
+    },
+    [buildSegmentsForChapter, playSegmentAt, startPagePlayback],
+  );
+
+  const nextPageAudio = useCallback(() => movePageAudio(1), [movePageAudio]);
+  const prevPageAudio = useCallback(() => movePageAudio(-1), [movePageAudio]);
+
   const nextChapter = useCallback(() => {
     const sess = sessionRef.current;
     if (!sess) return;
@@ -677,9 +1061,15 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
 
   const seekDeltaSeconds = useCallback(
     (delta: number) => {
-      const audio = audioRef.current;
       const sess = sessionRef.current;
-      if (!audio || !sess) return;
+      if (!sess) return;
+      if (activeEngineRef.current === "browser") {
+        if (delta < 0) prevSegment();
+        else nextSegment();
+        return;
+      }
+      const audio = audioRef.current;
+      if (!audio) return;
       const target = (audio.currentTime || 0) + delta;
       if (target < 0) {
         if (sess.currentSegmentIndex > 0) {
@@ -696,7 +1086,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       audio.currentTime = target;
       setCurrentTime(target);
     },
-    [nextSegment, playSegmentAt],
+    [nextSegment, playSegmentAt, prevSegment],
   );
 
   const jumpToSegmentIndex = useCallback(
@@ -724,21 +1114,11 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Otherwise resolve which chapter contains blockId
-      const bIdx = sess.reflowBook.blocks.findIndex((b) => b.id === blockId);
-      if (bIdx < 0) return;
-      let targetChap = 0;
-      for (let i = 0; i < sess.chapters.length; i++) {
-        const nextC = sess.chapters[i + 1];
-        if (!nextC || bIdx < nextC.blockIndex) {
-          targetChap = i;
-          break;
-        }
-      }
+      const resolved = resolveChapterAndBlockIndex(sess.reflowBook, sess.chapters, undefined, blockId);
       const built = buildSegmentsForChapter(
         sess.reflowBook,
         sess.chapters,
-        targetChap,
+        resolved.chapterIndex,
         sess.bookId,
         sess.language,
         prefsRef.current,
@@ -754,7 +1134,9 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       segIdx = Math.max(0, segIdx);
       const nextSess: AudiobookSession = {
         ...sess,
+        scope: "book",
         currentChapterIndex: built.chapterIndex,
+        currentPage: built.segments[segIdx]?.page ?? sess.currentPage,
         segments: built.segments,
         currentSegmentIndex: segIdx,
       };
@@ -776,6 +1158,26 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     (nextPrefs: UserVoicePreferences) => {
       const sess = sessionRef.current;
       if (!sess) return;
+      if (sess.scope === "selection") {
+        void playSegmentAt(sess, sess.currentSegmentIndex, 0);
+        return;
+      }
+      if (sess.scope === "page") {
+        const segs = buildPageAudioSegments({
+          bookId: sess.bookId,
+          book: sess.reflowBook,
+          page: sess.currentPage,
+          language: sess.language,
+          voiceId: nextPrefs.preferredVoice,
+          style: nextPrefs.preferredStyle,
+          translatedMap: sess.translatedMap,
+        });
+        if (!segs.length) return;
+        const idx = Math.min(sess.currentSegmentIndex, segs.length - 1);
+        void playSegmentAt({ ...sess, segments: segs, currentSegmentIndex: idx }, idx, 0);
+        return;
+      }
+
       const currentSeg = sess.segments[sess.currentSegmentIndex];
       const built = buildSegmentsForChapter(
         sess.reflowBook,
@@ -807,6 +1209,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
 
   const setVoiceAndApply = useCallback(
     (voiceId: GeminiPrebuiltVoiceId) => {
+      aiTtsCooldownUntilRef.current = 0;
       const next = { ...prefsRef.current, preferredVoice: voiceId };
       prefsRef.current = next;
       setPreferences(next);
@@ -814,6 +1217,43 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       rebuildSegmentsWithPrefs(next);
     },
     [rebuildSegmentsWithPrefs],
+  );
+
+  const setBrowserVoiceAndApply = useCallback(
+    (voiceURI: string) => {
+      const next: UserVoicePreferences = {
+        ...prefsRef.current,
+        preferredBrowserVoiceUri: voiceURI,
+      };
+      prefsRef.current = next;
+      setPreferences(next);
+      saveVoicePreferencesSync(next);
+      const sess = sessionRef.current;
+      if (sess && (activeEngineRef.current === "browser" || next.preferredAudioEngine === "browser")) {
+        void playSegmentAt(sess, sess.currentSegmentIndex, 0);
+      }
+    },
+    [playSegmentAt],
+  );
+
+  const setAudioEngineAndApply = useCallback(
+    (engine: AudioEnginePreference) => {
+      if (engine !== "browser") {
+        aiTtsCooldownUntilRef.current = 0;
+      }
+      const next: UserVoicePreferences = {
+        ...prefsRef.current,
+        preferredAudioEngine: engine,
+      };
+      prefsRef.current = next;
+      setPreferences(next);
+      saveVoicePreferencesSync(next);
+      const sess = sessionRef.current;
+      if (sess && statusRef.current !== "idle") {
+        void playSegmentAt(sess, sess.currentSegmentIndex, 0);
+      }
+    },
+    [playSegmentAt],
   );
 
   const setStyleAndApply = useCallback(
@@ -834,16 +1274,23 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       if (audioRef.current) {
         audioRef.current.playbackRate = clamped;
       }
+      webSpeechRef.current?.setRate(clamped);
+      const sess = sessionRef.current;
+      if (sess && activeEngineRef.current === "browser" && statusRef.current === "playing") {
+        void playSegmentAt(sess, sess.currentSegmentIndex, 0);
+      }
     },
-    [updatePreferences],
+    [playSegmentAt, updatePreferences],
   );
 
   const setVolume = useCallback((vol: number) => {
     const clamped = Math.min(1, Math.max(0, vol));
     setVolumeState(clamped);
+    volumeRef.current = clamped;
     if (audioRef.current) {
       audioRef.current.volume = clamped;
     }
+    webSpeechRef.current?.setVolume(clamped);
   }, []);
 
   const setSleepTimer = useCallback(
@@ -860,6 +1307,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
   );
 
   const retryCurrentSegment = useCallback(() => {
+    aiTtsCooldownUntilRef.current = 0;
     const sess = sessionRef.current;
     if (!sess) return;
     void playSegmentAt(sess, sess.currentSegmentIndex, 0);
@@ -870,6 +1318,7 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       const sess = sessionRef.current;
       if (!sess || sess.bookId !== bookId) return;
       if (sess.language !== language) return;
+      if (sess.scope === "selection") return;
       const currentSeg = sess.segments[sess.currentSegmentIndex];
       const built = buildSegmentsForChapter(
         sess.reflowBook,
@@ -938,6 +1387,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     () => ({
       session,
       status,
+      activeEngine,
+      availableBrowserVoices,
       error,
       errorCode,
       preferences,
@@ -949,6 +1400,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       sleepRemainingSec,
       activeSegment,
       startBookPlayback,
+      startPagePlayback,
+      startSelectionPlayback,
       unlockAudio,
       togglePlayPause,
       pausePlayback,
@@ -956,6 +1409,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       stopPlayback,
       nextSegment,
       prevSegment,
+      nextPageAudio,
+      prevPageAudio,
       nextChapter,
       prevChapter,
       seekDeltaSeconds,
@@ -964,6 +1419,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       jumpToBlockSentence,
       updatePreferences,
       setVoiceAndApply,
+      setBrowserVoiceAndApply,
+      setAudioEngineAndApply,
       setStyleAndApply,
       setSpeed,
       setVolume,
@@ -976,6 +1433,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
     [
       session,
       status,
+      activeEngine,
+      availableBrowserVoices,
       error,
       errorCode,
       preferences,
@@ -987,6 +1446,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       sleepRemainingSec,
       activeSegment,
       startBookPlayback,
+      startPagePlayback,
+      startSelectionPlayback,
       unlockAudio,
       togglePlayPause,
       pausePlayback,
@@ -994,6 +1455,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       stopPlayback,
       nextSegment,
       prevSegment,
+      nextPageAudio,
+      prevPageAudio,
       nextChapter,
       prevChapter,
       seekDeltaSeconds,
@@ -1002,6 +1465,8 @@ export function AudiobookProvider({ children }: { children: React.ReactNode }) {
       jumpToBlockSentence,
       updatePreferences,
       setVoiceAndApply,
+      setBrowserVoiceAndApply,
+      setAudioEngineAndApply,
       setStyleAndApply,
       setSpeed,
       setVolume,

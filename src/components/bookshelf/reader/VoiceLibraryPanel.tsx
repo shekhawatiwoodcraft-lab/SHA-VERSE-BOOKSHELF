@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   NARRATION_STYLES,
   VOICE_LIBRARY,
@@ -12,8 +12,14 @@ import { hashTextContent } from "@/lib/ai/segments";
 import {
   loadCachedAudioSegment,
   saveCachedAudioSegment,
+  type AudioEnginePreference,
   type UserVoicePreferences,
 } from "@/lib/ai/cache";
+import {
+  isWebSpeechSupported,
+  listBrowserVoicesForLanguage,
+  WebSpeechController,
+} from "@/lib/ai/webSpeechTts";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
@@ -22,7 +28,10 @@ import { cn } from "@/lib/utils";
 interface VoiceLibraryPanelProps {
   languageCode: string;
   preferences: UserVoicePreferences;
+  activeEngine?: "ai" | "browser";
   onSelectVoice: (voiceId: GeminiPrebuiltVoiceId) => void;
+  onSelectBrowserVoice?: (voiceURI: string) => void;
+  onChangeAudioEngine?: (engine: AudioEnginePreference) => void;
   onSelectStyle: (style: NarrationStyleId) => void;
   onUpdatePreferences: (patch: Partial<UserVoicePreferences>) => void;
   onBeforePreview?: () => void;
@@ -34,7 +43,10 @@ interface VoiceLibraryPanelProps {
 export default function VoiceLibraryPanel({
   languageCode,
   preferences,
+  activeEngine = "ai",
   onSelectVoice,
+  onSelectBrowserVoice,
+  onChangeAudioEngine,
   onSelectStyle,
   onUpdatePreferences,
   onBeforePreview,
@@ -44,15 +56,20 @@ export default function VoiceLibraryPanel({
   const [previewError, setPreviewError] = useState<string | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewUrlRef = useRef<string | null>(null);
-
+  const previewWsRef = useRef<WebSpeechController | null>(null);
   const previewAbortRef = useRef<AbortController | null>(null);
 
   const langMeta = getLanguageMeta(languageCode);
+  const browserVoiceInfo = useMemo(
+    () => listBrowserVoicesForLanguage(langMeta.code),
+    [langMeta.code],
+  );
 
   useEffect(() => {
     return () => {
       previewAbortRef.current?.abort();
       previewAudioRef.current?.pause();
+      previewWsRef.current?.cancel();
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
     };
   }, []);
@@ -61,6 +78,7 @@ export default function VoiceLibraryPanel({
     previewAbortRef.current?.abort();
     previewAbortRef.current = null;
     previewAudioRef.current?.pause();
+    previewWsRef.current?.cancel();
     if (previewUrlRef.current) {
       URL.revokeObjectURL(previewUrlRef.current);
       previewUrlRef.current = null;
@@ -93,6 +111,26 @@ export default function VoiceLibraryPanel({
     }
   };
 
+  const playBrowserSample = async (id: string, text: string, voiceUri?: string) => {
+    if (!isWebSpeechSupported()) {
+      throw new Error("Neither Studio AI preview nor device speech is supported on this browser.");
+    }
+    if (!previewWsRef.current) previewWsRef.current = new WebSpeechController();
+    setPlayingVoice(id);
+    await previewWsRef.current.speak({
+      text,
+      language: langMeta.code,
+      rate: preferences.preferredSpeed || 1,
+      volume: 1,
+      preferredVoiceUri: voiceUri || preferences.preferredBrowserVoiceUri,
+      onEnded: () => setPlayingVoice(null),
+      onError: (msg) => {
+        setPlayingVoice(null);
+        setPreviewError(msg);
+      },
+    });
+  };
+
   const handlePreviewVoice = async (voice: VoiceProfile) => {
     if (playingVoice === voice.id) {
       stopPreview();
@@ -107,8 +145,19 @@ export default function VoiceLibraryPanel({
     const controller = new AbortController();
     previewAbortRef.current = controller;
 
+    const sampleText = langMeta.code === "en" ? voice.exampleText : langMeta.previewPhrase;
+
+    if (preferences.preferredAudioEngine === "browser") {
+      try {
+        setPreviewingVoice(null);
+        await playBrowserSample(voice.id, sampleText);
+      } catch (err) {
+        setPreviewError(err instanceof Error ? err.message : "Could not play device voice sample.");
+      }
+      return;
+    }
+
     try {
-      const sampleText = langMeta.code === "en" ? voice.exampleText : langMeta.previewPhrase;
       const cacheKey = hashTextContent(
         `preview:${langMeta.code}:${voice.id}:${preferences.preferredStyle}:${sampleText}`,
       );
@@ -148,8 +197,16 @@ export default function VoiceLibraryPanel({
       setPlayingVoice(voice.id);
     } catch (err) {
       if ((err as { name?: string })?.name === "AbortError" || controller.signal.aborted) return;
+      if (preferences.preferredAudioEngine === "auto" && isWebSpeechSupported()) {
+        try {
+          await playBrowserSample(voice.id, sampleText);
+          return;
+        } catch {
+          /* fall through to message below */
+        }
+      }
       if (err instanceof AiServiceError && err.code === "AI_NOT_CONFIGURED") {
-        setPreviewError("Voice previews require GEMINI_API_KEY configured in server Settings > Secrets.");
+        setPreviewError("Studio AI previews require GEMINI_API_KEY; switch to Free Device Voice to hear instant audio.");
       } else {
         setPreviewError(err instanceof Error ? err.message : "Could not generate voice preview.");
       }
@@ -162,13 +219,112 @@ export default function VoiceLibraryPanel({
 
   return (
     <div className="space-y-5 text-sm">
-      <div className="pb-2 border-b border-border/60">
-        <p className="font-medium text-xs uppercase tracking-wider opacity-70">
-          Voice Narration Language
-        </p>
-        <p className="text-sm font-semibold mt-0.5">
-          {langMeta.name} ({langMeta.nativeName})
-        </p>
+      <div className="pb-2 border-b border-border/60 flex items-center justify-between gap-2">
+        <div>
+          <p className="font-medium text-xs uppercase tracking-wider opacity-70">
+            Voice Narration Language
+          </p>
+          <p className="text-sm font-semibold mt-0.5">
+            {langMeta.name} ({langMeta.nativeName})
+          </p>
+        </div>
+        <span className="text-[11px] px-2 py-0.5 rounded-md border border-border/70 bg-muted/40">
+          {activeEngine === "browser" ? "Device Voice · Free" : "Studio AI"}
+        </span>
+      </div>
+
+      {/* Audio Engine Preference */}
+      {onChangeAudioEngine && (
+        <div className="space-y-1.5">
+          <p className="text-xs font-medium uppercase tracking-wider opacity-70">
+            Voice Engine
+          </p>
+          <div className="grid grid-cols-3 gap-1.5">
+            {(
+              [
+                { id: "auto", label: "Auto (AI + Free)" },
+                { id: "browser", label: "Free Device" },
+                { id: "ai", label: "Studio AI" },
+              ] as const
+            ).map((opt) => {
+              const active = (preferences.preferredAudioEngine || "auto") === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => onChangeAudioEngine(opt.id)}
+                  className={cn(
+                    "rounded-md border px-2 py-1.5 text-xs transition-colors",
+                    active
+                      ? "border-primary bg-primary/10 font-semibold text-primary"
+                      : "border-border/70 hover:bg-muted/40",
+                  )}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Free Device Voices installed on this OS/Browser for this language */}
+      <div className="rounded-lg border border-border/70 p-3 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-xs font-semibold">
+            Free Device Voices ({browserVoiceInfo.matching.length} matched for {langMeta.name})
+          </p>
+          <span className="text-[11px] opacity-70">
+            {browserVoiceInfo.hasExactOrBaseMatch ? "Native ready" : `${browserVoiceInfo.all.length} total`}
+          </span>
+        </div>
+        {browserVoiceInfo.all.length > 0 ? (
+          <div className="flex items-center gap-2">
+            <select
+              aria-label="Free device voice"
+              value={preferences.preferredBrowserVoiceUri || ""}
+              onChange={(e) => onSelectBrowserVoice?.(e.target.value)}
+              className="flex-1 min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-xs"
+            >
+              <option value="">
+                Auto best device voice for {langMeta.name}
+              </option>
+              {(browserVoiceInfo.matching.length > 0
+                ? browserVoiceInfo.matching
+                : browserVoiceInfo.all
+              ).map((v) => (
+                <option key={v.voiceURI} value={v.voiceURI}>
+                  {v.name} ({v.lang})
+                </option>
+              ))}
+            </select>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 px-2.5 text-xs shrink-0"
+              onClick={() => {
+                if (playingVoice === "device-test") {
+                  stopPreview();
+                  return;
+                }
+                onBeforePreview?.();
+                stopPreview();
+                void playBrowserSample(
+                  "device-test",
+                  langMeta.previewPhrase,
+                  preferences.preferredBrowserVoiceUri,
+                );
+              }}
+            >
+              {playingVoice === "device-test" ? "Stop" : "Test"}
+            </Button>
+          </div>
+        ) : (
+          <p className="text-[11px] opacity-70">
+            No OS speech voices exposed in this headless/embedded view yet; Studio AI or browser voices activate automatically on supported devices.
+          </p>
+        )}
       </div>
 
       {previewError && (
@@ -177,11 +333,11 @@ export default function VoiceLibraryPanel({
         </div>
       )}
 
-      {/* 18 Voice Profiles with Examples — Clicking any voice immediately auto-starts the book */}
+      {/* 18 Studio Voice Profiles with Examples — Clicking any voice immediately auto-starts the book */}
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
           <p className="text-xs font-medium uppercase tracking-wider opacity-70">
-            Natural Voices ({VOICE_LIBRARY.length})
+            Studio Voice Profiles ({VOICE_LIBRARY.length})
           </p>
           <span className="text-[11px] opacity-70">Tap voice to start book</span>
         </div>

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   SUPPORTED_LANGUAGES,
   TRANSLATION_QUALITY_OPTIONS,
@@ -10,6 +10,7 @@ import {
 import type { Chapter } from "@/lib/reader/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
 interface TranslationPanelProps {
@@ -27,16 +28,25 @@ interface TranslationPanelProps {
   completedChapterIds: string[];
   failedChapterIds: string[];
   currentChapterIndex: number;
+  displayPage?: number;
   isTranslating: boolean;
   translationProgress: { done: number; total: number; label: string } | null;
   translationError: string | null;
   translationErrorCode: string | null;
   hasTranslatedSample: boolean;
+  initialQuickText?: string;
+  onTranslateQuickText?: (text: string) => Promise<{
+    translatedText: string;
+    dir: "ltr" | "rtl";
+    provider?: string;
+  }>;
+  onListenQuickText?: (text: string, languageCode: string) => void;
   onTranslateSample: () => void;
   onTranslateChapter: (chapterIndex: number) => void;
   onTranslateFullBook: () => void;
   onPauseTranslation: () => void;
   onRetryFailed: () => void;
+  onListenOriginal?: () => void;
   onListenTranslated: () => void;
 }
 
@@ -55,19 +65,41 @@ export default function TranslationPanel({
   completedChapterIds,
   failedChapterIds,
   currentChapterIndex,
+  displayPage = 1,
   isTranslating,
   translationProgress,
   translationError,
   translationErrorCode,
   hasTranslatedSample,
+  initialQuickText = "",
+  onTranslateQuickText,
+  onListenQuickText,
   onTranslateSample,
   onTranslateChapter,
   onTranslateFullBook,
   onPauseTranslation,
   onRetryFailed,
+  onListenOriginal,
   onListenTranslated,
 }: TranslationPanelProps) {
   const [langSearch, setLangSearch] = useState("");
+  const [quickInput, setQuickInput] = useState(initialQuickText);
+  const [quickResult, setQuickResult] = useState<{
+    translatedText: string;
+    dir: "ltr" | "rtl";
+    provider?: string;
+  } | null>(null);
+  const [quickLoading, setQuickLoading] = useState(false);
+  const [quickErr, setQuickErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (initialQuickText && initialQuickText !== quickInput) {
+      setQuickInput(initialQuickText);
+      setQuickResult(null);
+      setQuickErr(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialQuickText]);
 
   const srcMeta = getLanguageMeta(sourceLanguage);
   const tgtMeta = getLanguageMeta(targetLanguage);
@@ -76,6 +108,20 @@ export default function TranslationPanel({
   const completedSet = useMemo(() => new Set(completedChapterIds), [completedChapterIds]);
   const currentChapter = chapters[currentChapterIndex];
   const currentChapterDone = currentChapter ? completedSet.has(currentChapter.id) : false;
+
+  const handleQuickTranslate = async () => {
+    if (!onTranslateQuickText || !quickInput.trim()) return;
+    setQuickLoading(true);
+    setQuickErr(null);
+    try {
+      const res = await onTranslateQuickText(quickInput.trim());
+      setQuickResult(res);
+    } catch (err) {
+      setQuickErr(err instanceof Error ? err.message : "Could not translate this text.");
+    } finally {
+      setQuickLoading(false);
+    }
+  };
 
   return (
     <div className="space-y-5 text-sm pb-8">
@@ -121,6 +167,75 @@ export default function TranslationPanel({
         </div>
       </div>
 
+      {/* Selected Text / Sentence Instant Translator */}
+      {onTranslateQuickText && (
+        <div className="rounded-lg border border-border/70 p-3 space-y-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold">
+              Selected Text / Single Sentence Translator
+            </p>
+            <span className="text-[11px] opacity-70">Original stays unchanged</span>
+          </div>
+          <Textarea
+            aria-label="Selected text or sentence to translate"
+            value={quickInput}
+            onChange={(e) => setQuickInput(e.target.value)}
+            rows={2}
+            placeholder="Highlight text while reading, or type/paste any sentence or paragraph here..."
+            className="text-xs min-h-[58px]"
+          />
+          <div className="flex items-center gap-2 flex-wrap">
+            <Button
+              type="button"
+              size="sm"
+              disabled={quickLoading || !quickInput.trim()}
+              onClick={() => void handleQuickTranslate()}
+              className="h-8 text-xs"
+            >
+              {quickLoading ? "Translating..." : `Translate to ${tgtMeta.nativeName}`}
+            </Button>
+            {onListenQuickText && quickInput.trim() && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => onListenQuickText(quickInput.trim(), srcMeta.code)}
+                className="h-8 text-xs"
+              >
+                Listen Original
+              </Button>
+            )}
+          </div>
+          {quickErr && (
+            <p className="text-xs text-destructive">{quickErr}</p>
+          )}
+          {quickResult && (
+            <div
+              className="rounded-md border border-primary/30 bg-primary/5 p-2.5 space-y-2"
+              dir={quickResult.dir}
+            >
+              <p className="text-xs font-medium leading-relaxed">{quickResult.translatedText}</p>
+              {onListenQuickText && (
+                <div className="flex items-center justify-between gap-2" dir="ltr">
+                  <span className="text-[10px] opacity-70">
+                    {tgtMeta.name} ({tgtMeta.nativeName})
+                  </span>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => onListenQuickText(quickResult.translatedText, tgtMeta.code)}
+                    className="h-7 px-2.5 text-xs"
+                  >
+                    Listen Translated
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Searchable A-Z Language Menu: Clicking any language translates immediately */}
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-2">
@@ -142,11 +257,11 @@ export default function TranslationPanel({
         />
 
         <p className="text-[11px] opacity-70">
-          Tap any language below to translate this book immediately and sync Audio Reader to that language.
+          Tap any language below to translate this page immediately and sync Audio Reader to that language.
         </p>
 
         <div
-          className="max-h-60 overflow-y-auto rounded-lg border border-border/70 divide-y divide-border/50"
+          className="max-h-52 overflow-y-auto rounded-lg border border-border/70 divide-y divide-border/50"
           role="listbox"
           aria-label="All languages A to Z"
         >
@@ -232,7 +347,7 @@ export default function TranslationPanel({
           <div>
             <p className="font-semibold">
               {translationErrorCode === "AI_NOT_CONFIGURED"
-                ? "AI Translation Not Configured"
+                ? "Translation Service Notice"
                 : "Translation Notice"}
             </p>
             <p className="opacity-90 mt-0.5">{translationError}</p>
@@ -312,8 +427,11 @@ export default function TranslationPanel({
         </div>
       </div>
 
-      {/* Extra Chapter / Full Book Controls */}
+      {/* Page / Chapter / Full Book Translation + 4 Combined Workflows */}
       <div className="space-y-2 pt-1">
+        <p className="text-xs font-medium uppercase tracking-wider opacity-70">
+          Book &amp; Page Translation Levels
+        </p>
         <div className="grid grid-cols-1 gap-2">
           <Button
             type="button"
@@ -323,7 +441,7 @@ export default function TranslationPanel({
           >
             {isTranslating
               ? "Translating..."
-              : `Translate Current Pages (${tgtMeta.nativeName})`}
+              : `Translate Current Page p.${displayPage} (${tgtMeta.nativeName})`}
           </Button>
 
           <div className="grid grid-cols-2 gap-2">
@@ -349,19 +467,30 @@ export default function TranslationPanel({
           </div>
         </div>
 
-        {(hasTranslatedSample || currentChapterDone) && (
+        {/* Audio & Translation Combined Workflows */}
+        <div className="grid grid-cols-2 gap-2 pt-1">
+          {onListenOriginal && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={onListenOriginal}
+              className="h-9 text-xs"
+            >
+              Listen Original ({srcMeta.name})
+            </Button>
+          )}
           <Button
             type="button"
-            variant="secondary"
+            variant={hasTranslatedSample || currentChapterDone ? "secondary" : "outline"}
             onClick={onListenTranslated}
-            className="w-full h-9 text-xs font-medium"
+            className={cn("h-9 text-xs font-medium", !onListenOriginal && "col-span-2")}
           >
-            Listen in {tgtMeta.name} ({tgtMeta.nativeName})
+            Listen Translated ({tgtMeta.nativeName})
           </Button>
-        )}
+        </div>
 
         <p className="text-[11px] opacity-65 text-center leading-relaxed">
-          {completedChapterIds.length}/{Math.max(1, chapters.length)} chapters cached locally.
+          {completedChapterIds.length}/{Math.max(1, chapters.length)} chapters cached locally · Original book preserved separately.
         </p>
       </div>
     </div>

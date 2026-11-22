@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertTriangle, Trash2 } from "lucide-react";
 import {
   Dialog,
@@ -19,12 +19,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useBookInteractions } from "@/hooks/useBookInteractions";
+import { canConfirmPermanentBookDelete } from "@/modules/bookshelf/lib/bookDeletion";
 
 interface BookDeletionDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   bookId: string;
   bookTitle: string;
+  onDeleted?: () => void;
 }
 
 const DELETION_REASONS = [
@@ -35,19 +37,41 @@ const DELETION_REASONS = [
   { value: "other", label: "Other" },
 ];
 
-const BookDeletionDialog = ({ open, onOpenChange, bookId, bookTitle }: BookDeletionDialogProps) => {
-  const { submitDeletionRequest } = useBookInteractions(bookId);
+const BookDeletionDialog = ({
+  open,
+  onOpenChange,
+  bookId,
+  bookTitle,
+  onDeleted,
+}: BookDeletionDialogProps) => {
+  const { deleteBookPermanently } = useBookInteractions(bookId);
   const [reason, setReason] = useState("");
   const [description, setDescription] = useState("");
   const [confirmed, setConfirmed] = useState(false);
 
-  const handleSubmit = async () => {
-    if (!reason || !confirmed) return;
-    await submitDeletionRequest.mutateAsync({ reason, description: description || undefined });
-    onOpenChange(false);
+  // Always start unchecked when opening or closing so accidental deletions cannot happen
+  useEffect(() => {
+    if (!open) {
+      setConfirmed(false);
+      setReason("");
+      setDescription("");
+    }
+  }, [open]);
+
+  const canDelete = canConfirmPermanentBookDelete({
+    bookId,
+    confirmed,
+    isDeleting: deleteBookPermanently.isPending,
+  });
+
+  const handleDelete = async () => {
+    if (!canDelete) return;
+    await deleteBookPermanently.mutateAsync();
     setReason("");
     setDescription("");
     setConfirmed(false);
+    onOpenChange(false);
+    onDeleted?.();
   };
 
   return (
@@ -56,20 +80,19 @@ const BookDeletionDialog = ({ open, onOpenChange, bookId, bookTitle }: BookDelet
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 text-destructive">
             <Trash2 className="w-5 h-5" />
-            Request Book Deletion
+            Delete Book Permanently
           </DialogTitle>
           <DialogDescription>
-            Submit a request to delete "{bookTitle}". Once submitted, your book is permanently deleted within 3 hours.
+            Confirm below to permanently delete "{bookTitle}". This removes the book immediately.
           </DialogDescription>
-
         </DialogHeader>
 
         <div className="space-y-4 py-4">
           {/* Warning */}
-          <div className="flex items-start gap-3 p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20">
-            <AlertTriangle className="w-5 h-5 text-yellow-500 flex-shrink-0 mt-0.5" />
-            <p className="text-sm text-yellow-600 dark:text-yellow-400">
-              This action cannot be undone. Your book will be permanently deleted within 3 hours of submitting this request.
+          <div className="flex items-start gap-3 p-3 rounded-lg bg-destructive/10 border border-destructive/20">
+            <AlertTriangle className="w-5 h-5 text-destructive flex-shrink-0 mt-0.5" />
+            <p className="text-sm text-destructive">
+              This action cannot be undone. Once confirmed, this book and its files will be permanently deleted right away.
             </p>
           </div>
 
@@ -79,12 +102,12 @@ const BookDeletionDialog = ({ open, onOpenChange, bookId, bookTitle }: BookDelet
             <p className="text-xs text-muted-foreground">ID: {bookId}</p>
           </div>
 
-          {/* Reason */}
+          {/* Optional Reason */}
           <div>
-            <Label htmlFor="reason">Reason for deletion *</Label>
+            <Label htmlFor="delete-reason">Reason (optional)</Label>
             <Select value={reason} onValueChange={setReason}>
-              <SelectTrigger className="mt-2">
-                <SelectValue placeholder="Select a reason" />
+              <SelectTrigger id="delete-reason" className="mt-2">
+                <SelectValue placeholder="Select a reason (optional)" />
               </SelectTrigger>
               <SelectContent className="z-[80]">
                 {DELETION_REASONS.map((r) => (
@@ -96,44 +119,55 @@ const BookDeletionDialog = ({ open, onOpenChange, bookId, bookTitle }: BookDelet
             </Select>
           </div>
 
-          {/* Description */}
+          {/* Optional Details */}
           <div>
-            <Label htmlFor="description">Additional details</Label>
+            <Label htmlFor="delete-description">Additional notes (optional)</Label>
             <Textarea
-              id="description"
+              id="delete-description"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Please provide more details about your request..."
-              rows={3}
+              placeholder="Optional notes..."
+              rows={2}
               className="mt-2"
             />
           </div>
 
-          {/* Confirmation */}
-          <div className="flex items-start gap-2">
+          {/* Mandatory Confirmation Checkbox */}
+          <div className="flex items-start gap-2.5 p-3 rounded-lg border bg-muted/40">
             <Checkbox
-              id="confirm"
+              id="confirm-permanent-delete"
               checked={confirmed}
               onCheckedChange={(checked) => setConfirmed(checked === true)}
+              disabled={deleteBookPermanently.isPending}
+              className="mt-0.5"
             />
-            <Label htmlFor="confirm" className="text-sm leading-tight cursor-pointer">
-              I understand that my book will be permanently deleted within 3 hours and this is irreversible.
+            <Label
+              htmlFor="confirm-permanent-delete"
+              className="text-sm leading-snug cursor-pointer select-none"
+            >
+              I confirm that I want to permanently delete this book immediately, and I understand this cannot be undone.
             </Label>
-
           </div>
 
           {/* Actions */}
-          <div className="flex gap-2 pt-4">
-            <Button variant="outline" className="flex-1" onClick={() => onOpenChange(false)}>
+          <div className="flex gap-2 pt-2">
+            <Button
+              type="button"
+              variant="outline"
+              className="flex-1"
+              disabled={deleteBookPermanently.isPending}
+              onClick={() => onOpenChange(false)}
+            >
               Cancel
             </Button>
             <Button
+              type="button"
               variant="destructive"
               className="flex-1"
-              onClick={handleSubmit}
-              disabled={!reason || !confirmed || submitDeletionRequest.isPending}
+              onClick={handleDelete}
+              disabled={!canDelete}
             >
-              {submitDeletionRequest.isPending ? "Submitting..." : "Submit Request"}
+              {deleteBookPermanently.isPending ? "Deleting..." : "Delete Permanently"}
             </Button>
           </div>
         </div>

@@ -20,6 +20,7 @@ export class AiServiceError extends Error {
 
 export interface AiHealthStatus {
   configured: boolean;
+  freeFallbackAvailable?: boolean;
   models: {
     translation: string;
     tts: string;
@@ -37,6 +38,7 @@ export interface LanguageDetectionResult {
   nativeName: string;
   dir: "ltr" | "rtl";
   confidence: number;
+  provider?: string;
 }
 
 export interface TranslationBatchResponse {
@@ -44,6 +46,7 @@ export interface TranslationBatchResponse {
   glossaryAdditions: Array<{ source: string; target: string }>;
   targetLanguage: string;
   dir: "ltr" | "rtl";
+  provider?: string;
   cached?: boolean;
 }
 
@@ -69,6 +72,10 @@ async function fetchWithAuthRetry(
     const freshHeaders = await authHeaders(extraHeaders, true);
     if (freshHeaders.Authorization && freshHeaders.Authorization !== headers.Authorization) {
       return fetch(url, { ...rest, headers: freshHeaders });
+    }
+    if (headers.Authorization) {
+      // Stale client token rejected -> fall back to guest reading access
+      return fetch(url, { ...rest, headers: { ...(extraHeaders || {}) } });
     }
   }
   return res;
@@ -139,6 +146,37 @@ export async function translateBookBatch(params: {
   });
   if (!res.ok) throw await parseErrorResponse(res);
   return (await res.json()) as TranslationBatchResponse;
+}
+
+export async function translateTextQuick(params: {
+  text: string;
+  sourceLanguage?: string;
+  targetLanguage: string;
+  quality?: TranslationQuality;
+  bookTitle?: string;
+  glossary?: Array<{ source: string; target: string }>;
+  signal?: AbortSignal;
+}): Promise<{
+  translatedText: string;
+  targetLanguage: string;
+  dir: "ltr" | "rtl";
+  provider?: string;
+}> {
+  const resp = await translateBookBatch({
+    bookTitle: params.bookTitle,
+    sourceLanguage: params.sourceLanguage || "auto",
+    targetLanguage: params.targetLanguage,
+    quality: params.quality || "high",
+    blocks: [{ id: "quick_0", type: "paragraph", text: params.text }],
+    glossary: params.glossary,
+    signal: params.signal,
+  });
+  return {
+    translatedText: resp.items[0]?.translatedText || "",
+    targetLanguage: resp.targetLanguage,
+    dir: resp.dir,
+    provider: resp.provider,
+  };
 }
 
 export async function generateSpeechWav(params: {

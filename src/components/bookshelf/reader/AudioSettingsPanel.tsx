@@ -25,7 +25,9 @@ interface AudioSettingsPanelProps {
   listenInTranslated: boolean;
   onChangeListenInTranslated: (useTranslated: boolean) => void;
   savedListenProgress: ListeningProgressRecord | null;
-  onStartChoice: (mode: "resume" | "reading_pos" | "chapter" | "beginning") => void;
+  selectedExcerptText?: string;
+  onStartSelectionAudio?: (text: string, useTranslated?: boolean) => void;
+  onStartChoice: (mode: "resume" | "reading_pos" | "page" | "chapter" | "beginning") => void;
   onSelectVoiceAndStart: (voiceId: GeminiPrebuiltVoiceId) => void;
   onSyncPageToAudio?: () => void;
   onOpenTranslationTab?: () => void;
@@ -53,6 +55,8 @@ export default function AudioSettingsPanel({
   listenInTranslated,
   onChangeListenInTranslated,
   savedListenProgress,
+  selectedExcerptText,
+  onStartSelectionAudio,
   onStartChoice,
   onSelectVoiceAndStart,
   onSyncPageToAudio,
@@ -61,6 +65,7 @@ export default function AudioSettingsPanel({
   const {
     session,
     status,
+    activeEngine,
     error,
     errorCode,
     preferences,
@@ -72,10 +77,16 @@ export default function AudioSettingsPanel({
     togglePlayPause,
     pausePlayback,
     stopPlayback,
+    nextSegment,
+    prevSegment,
+    nextPageAudio,
+    prevPageAudio,
     nextChapter,
     prevChapter,
     seekDeltaSeconds,
     jumpToSegmentIndex,
+    setBrowserVoiceAndApply,
+    setAudioEngineAndApply,
     setStyleAndApply,
     updatePreferences,
     setSpeed,
@@ -127,18 +138,24 @@ export default function AudioSettingsPanel({
                     ? "Generating Audio..."
                     : status === "error"
                       ? "Playback Paused"
-                      : "Paused"}
+                      : "Paused"}{" "}
+                · {activeEngine === "browser" ? "Device Voice (Free)" : "Studio AI"}
               </p>
               <p className="font-semibold text-sm truncate mt-0.5">
-                {currentChapter?.title || session.bookTitle}
+                {session.scope === "selection"
+                  ? "Selected Text Audio"
+                  : session.scope === "page"
+                    ? `Page ${session.currentPage}`
+                    : currentChapter?.title || session.bookTitle}
               </p>
               <p className="text-xs opacity-75 truncate">
-                {activeLangMeta.name} ({activeLangMeta.nativeName}) · {preferences.preferredVoice} ·{" "}
+                {activeLangMeta.name} ({activeLangMeta.nativeName}) ·{" "}
+                {activeEngine === "browser" ? "Device" : preferences.preferredVoice} ·{" "}
                 {session.currentSegmentIndex + 1}/{segCount} segments
               </p>
             </div>
             <div className="flex items-center gap-1 shrink-0">
-              {onSyncPageToAudio && (
+              {onSyncPageToAudio && session.scope !== "selection" && (
                 <Button
                   type="button"
                   variant="outline"
@@ -167,7 +184,7 @@ export default function AudioSettingsPanel({
             <div className="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 flex items-center justify-between gap-2 text-xs text-destructive">
               <span className="truncate">
                 {errorCode === "AI_NOT_CONFIGURED"
-                  ? "GEMINI_API_KEY is not configured on the server."
+                  ? "Studio AI TTS unavailable. Switch to Free Device Voice below."
                   : error}
               </span>
               <Button
@@ -204,7 +221,7 @@ export default function AudioSettingsPanel({
             </span>
           </div>
 
-          <div className="flex items-center justify-center gap-1.5 flex-wrap">
+          <div className="flex items-center justify-center gap-1 flex-wrap">
             <Button
               type="button"
               variant="outline"
@@ -215,6 +232,28 @@ export default function AudioSettingsPanel({
               className="h-8 px-2 text-xs"
             >
               Prev Ch
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-label="Previous page audio"
+              disabled={(activeSegment?.page || session.currentPage) <= 1}
+              onClick={prevPageAudio}
+              className="h-8 px-2 text-xs"
+            >
+              Pg-
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-label="Previous paragraph audio"
+              disabled={session.currentSegmentIndex <= 0 && session.currentChapterIndex <= 0}
+              onClick={prevSegment}
+              className="h-8 px-2 text-xs"
+            >
+              Prev Para
             </Button>
             <Button
               type="button"
@@ -249,6 +288,30 @@ export default function AudioSettingsPanel({
               type="button"
               variant="outline"
               size="sm"
+              aria-label="Next paragraph audio"
+              disabled={
+                session.currentSegmentIndex >= session.segments.length - 1 &&
+                session.currentChapterIndex >= session.chapters.length - 1
+              }
+              onClick={nextSegment}
+              className="h-8 px-2 text-xs"
+            >
+              Next Para
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-label="Next page audio"
+              onClick={nextPageAudio}
+              className="h-8 px-2 text-xs"
+            >
+              Pg+
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
               aria-label="Next chapter audio"
               disabled={session.currentChapterIndex >= session.chapters.length - 1}
               onClick={nextChapter}
@@ -264,7 +327,7 @@ export default function AudioSettingsPanel({
       <div className="space-y-3">
         <div className="flex items-center justify-between gap-2">
           <p className="text-xs font-medium uppercase tracking-wider opacity-70">
-            Audio Language
+            Audio Workflow &amp; Language
           </p>
           {onOpenTranslationTab && (
             <button
@@ -313,8 +376,22 @@ export default function AudioSettingsPanel({
 
         <div className="space-y-1.5 pt-1">
           <p className="text-xs font-medium opacity-75">
-            {isActiveForThisBook ? "Jump or restart from" : "Start listening"}
+            {isActiveForThisBook ? "Start or switch audio level" : "Choose what to listen to"}
           </p>
+
+          {selectedExcerptText && onStartSelectionAudio && (
+            <Button
+              type="button"
+              variant="secondary"
+              className="w-full justify-start text-left h-auto py-2"
+              onClick={() => onStartSelectionAudio(selectedExcerptText, effectiveUseTranslated)}
+            >
+              <div className="min-w-0">
+                <div className="text-xs font-semibold">Listen to Selected Text</div>
+                <div className="text-[11px] opacity-80 truncate">"{selectedExcerptText}"</div>
+              </div>
+            </Button>
+          )}
 
           {savedListenProgress && (
             <Button
@@ -334,15 +411,26 @@ export default function AudioSettingsPanel({
             </Button>
           )}
 
-          <Button
-            type="button"
-            variant={savedListenProgress || isActiveForThisBook ? "outline" : "default"}
-            disabled={!hasTextReady || isPreparingTranslation}
-            className="w-full justify-start text-left h-9 text-xs font-medium"
-            onClick={() => onStartChoice("reading_pos")}
-          >
-            Start from current reading position (p.{displayPage})
-          </Button>
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={!hasTextReady || isPreparingTranslation}
+              className="justify-start text-left h-9 text-xs"
+              onClick={() => onStartChoice("page")}
+            >
+              Current page (p.{displayPage})
+            </Button>
+            <Button
+              type="button"
+              variant={savedListenProgress || isActiveForThisBook ? "outline" : "default"}
+              disabled={!hasTextReady || isPreparingTranslation}
+              className="justify-start text-left h-9 text-xs font-medium"
+              onClick={() => onStartChoice("reading_pos")}
+            >
+              Continue from p.{displayPage}
+            </Button>
+          </div>
 
           <div className="grid grid-cols-2 gap-2">
             <Button
@@ -361,7 +449,7 @@ export default function AudioSettingsPanel({
               className="justify-start text-left h-9 text-xs"
               onClick={() => onStartChoice("beginning")}
             >
-              From beginning
+              Full book (from start)
             </Button>
           </div>
         </div>
@@ -441,11 +529,14 @@ export default function AudioSettingsPanel({
 
       <Separator />
 
-      {/* 18 Voice Profiles with Examples & Instant Auto-Start on Click */}
+      {/* AI + Free Device Voice Library */}
       <VoiceLibraryPanel
         languageCode={activeLanguageCode}
         preferences={preferences}
+        activeEngine={activeEngine}
         onSelectVoice={onSelectVoiceAndStart}
+        onSelectBrowserVoice={setBrowserVoiceAndApply}
+        onChangeAudioEngine={setAudioEngineAndApply}
         onSelectStyle={setStyleAndApply}
         onUpdatePreferences={updatePreferences}
         onBeforePreview={pausePlayback}

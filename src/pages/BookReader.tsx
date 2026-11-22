@@ -41,6 +41,7 @@ import {
   chunkBlocksByBudget,
   extractCandidateGlossaryTerms,
   getChapterBlockRange,
+  getPageTextBlocks,
   hashTextContent,
   resolveBookChapters,
 } from "@/lib/ai/segments";
@@ -58,6 +59,7 @@ import {
   AiServiceError,
   detectBookLanguage,
   translateBookBatch,
+  translateTextQuick,
 } from "@/lib/ai/client";
 import {
   DropdownMenu,
@@ -217,6 +219,11 @@ const BookReader = () => {
     return reflow.book;
   }, [fileType, epubReflowBook, reflow.book]);
 
+  const reflowBookRef = useRef<ReflowBook | null>(reflow.book);
+  const reflowStatusRef = useRef(reflow.status);
+  reflowBookRef.current = reflow.book;
+  reflowStatusRef.current = reflow.status;
+
   const activeChapters = useMemo(
     () => (activeReflowBook ? resolveBookChapters(activeReflowBook) : []),
     [activeReflowBook],
@@ -265,6 +272,7 @@ const BookReader = () => {
   const [savedListenProgress, setSavedListenProgress] =
     useState<ListeningProgressRecord | null>(null);
   const [listenInTranslated, setListenInTranslated] = useState(false);
+  const [selectedBookText, setSelectedBookText] = useState("");
   const currentLocationBlockRef = useRef<{ blockId: string; blockIndex: number }>({
     blockId: "",
     blockIndex: 0,
@@ -387,10 +395,24 @@ const BookReader = () => {
   const ensureStructuredBook = useCallback(async (): Promise<ReflowBook | null> => {
     if (fileType === "pdf") {
       if (!aiExtractionRequested) setAiExtractionRequested(true);
-      if (reflow.book && (hasTextBlocks(reflow.book) || reflow.status === "ready")) {
-        return reflow.book;
+      if (!pdfExtractionArmed) setPdfExtractionArmed(true);
+      const current = reflowBookRef.current;
+      if (current && (hasTextBlocks(current) || reflowStatusRef.current === "ready")) {
+        return current;
       }
-      return null;
+      // Wait briefly for initial PDF text extraction batches when opened straight to Settings
+      const deadline = Date.now() + 12_000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => window.setTimeout(r, 180));
+        const latest = reflowBookRef.current;
+        if (latest && (hasTextBlocks(latest) || reflowStatusRef.current === "ready")) {
+          return latest;
+        }
+        if (reflowStatusRef.current === "error") {
+          return latest ?? null;
+        }
+      }
+      return reflowBookRef.current ?? null;
     }
     if (fileType === "epub" && book?.book_url && bookId) {
       if (epubReflowBook && epubReflowBook.blocks.length > 0) return epubReflowBook;
@@ -409,7 +431,7 @@ const BookReader = () => {
       }
     }
     return null;
-  }, [fileType, aiExtractionRequested, reflow.book, reflow.status, hasTextBlocks, book?.book_url, book?.title, book?.author, bookId, epubReflowBook]);
+  }, [fileType, aiExtractionRequested, pdfExtractionArmed, hasTextBlocks, book?.book_url, book?.title, book?.author, bookId, epubReflowBook]);
 
   // Load saved detected language and cached translation for current (bookId, targetLanguage, quality)
   useEffect(() => {
@@ -502,6 +524,7 @@ const BookReader = () => {
       maxBlocksOverride?: number,
       startOffsetBlockIndex?: number,
       overrideTargetLanguage?: string,
+      specificBlocksOverride?: Array<Extract<ReflowBook["blocks"][number], { type: "heading" | "paragraph" }>>,
     ): Promise<Record<string, string>> => {
       if (!bookId) return existingMap;
       const effectiveTargetLang = overrideTargetLanguage || targetLanguage;
@@ -527,22 +550,24 @@ const BookReader = () => {
       }
 
       try {
-        // Sample translation mode (first ~24 text blocks around current location)
-        if (typeof maxBlocksOverride === "number") {
+        // Page / selective block translation mode
+        if (typeof maxBlocksOverride === "number" || (specificBlocksOverride && specificBlocksOverride.length > 0)) {
           const fromIdx = Math.max(0, startOffsetBlockIndex ?? 0);
-          let sampleBlocks = structBook.blocks
-            .slice(fromIdx)
-            .filter((b): b is Extract<typeof b, { type: "heading" | "paragraph" }> =>
-              b.type === "heading" || b.type === "paragraph",
-            )
-            .slice(0, maxBlocksOverride);
+          let sampleBlocks = specificBlocksOverride && specificBlocksOverride.length > 0
+            ? specificBlocksOverride
+            : structBook.blocks
+                .slice(fromIdx)
+                .filter((b): b is Extract<typeof b, { type: "heading" | "paragraph" }> =>
+                  b.type === "heading" || b.type === "paragraph",
+                )
+                .slice(0, maxBlocksOverride ?? 8);
 
           if (sampleBlocks.length === 0) {
             sampleBlocks = structBook.blocks
               .filter((b): b is Extract<typeof b, { type: "heading" | "paragraph" }> =>
                 b.type === "heading" || b.type === "paragraph",
               )
-              .slice(0, maxBlocksOverride);
+              .slice(0, maxBlocksOverride ?? 8);
           }
 
           if (sampleBlocks.length === 0) {
@@ -785,6 +810,13 @@ const BookReader = () => {
       setTranslationError("Book text is still preparing. Please try again in a second.");
       return;
     }
+    const pageItems = getPageTextBlocks(
+      structBook,
+      observedDisplayPage,
+      currentLocationBlockRef.current.blockIndex,
+      8,
+    );
+    const pageBlocks = pageItems.map((p) => p.block);
     await runChapterTranslation(
       structBook,
       [currentChapterIndex],
@@ -792,11 +824,14 @@ const BookReader = () => {
       completedChapterIds,
       failedChapterIds,
       glossary,
-      4,
-      currentLocationBlockRef.current.blockIndex,
+      undefined,
+      pageItems[0]?.blockIndex ?? currentLocationBlockRef.current.blockIndex,
+      undefined,
+      pageBlocks,
     );
   }, [
     ensureStructuredBook,
+    observedDisplayPage,
     runChapterTranslation,
     currentChapterIndex,
     translatedMap,
@@ -946,6 +981,12 @@ const BookReader = () => {
       }
 
       pendingAutoTranslateLangRef.current = null;
+      const pageItems = getPageTextBlocks(
+        structBook,
+        observedDisplayPage,
+        currentLocationBlockRef.current.blockIndex,
+        8,
+      );
       await runChapterTranslation(
         structBook,
         [currentChapterIndex],
@@ -953,9 +994,10 @@ const BookReader = () => {
         cachedCompleted,
         cachedFailed,
         cachedGlossary,
-        4,
-        currentLocationBlockRef.current.blockIndex,
+        undefined,
+        pageItems[0]?.blockIndex ?? currentLocationBlockRef.current.blockIndex,
         newLangCode,
+        pageItems.map((p) => p.block),
       );
     },
     [
@@ -964,6 +1006,7 @@ const BookReader = () => {
       translationQuality,
       audiobook,
       ensureStructuredBook,
+      observedDisplayPage,
       runChapterTranslation,
       currentChapterIndex,
     ],
@@ -974,6 +1017,12 @@ const BookReader = () => {
     const pendingLang = pendingAutoTranslateLangRef.current;
     if (!pendingLang || !activeReflowBook || !hasTextBlocks(activeReflowBook)) return;
     pendingAutoTranslateLangRef.current = null;
+    const pageItems = getPageTextBlocks(
+      activeReflowBook,
+      observedDisplayPage,
+      currentLocationBlockRef.current.blockIndex,
+      8,
+    );
     void runChapterTranslation(
       activeReflowBook,
       [currentChapterIndex],
@@ -981,11 +1030,12 @@ const BookReader = () => {
       [],
       [],
       [],
-      4,
-      currentLocationBlockRef.current.blockIndex,
+      undefined,
+      pageItems[0]?.blockIndex ?? currentLocationBlockRef.current.blockIndex,
       pendingLang,
+      pageItems.map((p) => p.block),
     );
-  }, [activeReflowBook, currentChapterIndex, hasTextBlocks, runChapterTranslation]);
+  }, [activeReflowBook, currentChapterIndex, hasTextBlocks, observedDisplayPage, runChapterTranslation]);
 
   const prepareAudioTabState = useCallback(async () => {
     if (!bookId || !book) return;
@@ -1097,9 +1147,13 @@ const BookReader = () => {
     async (
       structBook: ReflowBook,
       startBlockIdx: number,
+      overrideWantTranslated?: boolean,
+      blocksForPage?: Array<Extract<ReflowBook["blocks"][number], { type: "heading" | "paragraph" }>>,
     ): Promise<{ audioLang: string; audioMap?: Record<string, string> }> => {
       const wantTranslated =
-        listenInTranslated && targetLanguage !== sourceLanguage;
+        typeof overrideWantTranslated === "boolean"
+          ? overrideWantTranslated && targetLanguage !== sourceLanguage
+          : listenInTranslated && targetLanguage !== sourceLanguage;
       if (!wantTranslated || !bookId) {
         return { audioLang: sourceLanguage, audioMap: undefined };
       }
@@ -1119,7 +1173,8 @@ const BookReader = () => {
       const targetBlock = structBook.blocks[startBlockIdx] ?? structBook.blocks.find(
         (b) => b.type === "paragraph" || b.type === "heading",
       );
-      if (targetBlock && !currentMap[targetBlock.id]) {
+      const missingBlocks = blocksForPage?.filter((b) => !currentMap[b.id]) ?? [];
+      if ((targetBlock && !currentMap[targetBlock.id]) || missingBlocks.length > 0) {
         setIsPreparingTranslationForAudio(true);
         try {
           currentMap = await runChapterTranslation(
@@ -1129,9 +1184,10 @@ const BookReader = () => {
             completedChapterIds,
             failedChapterIds,
             glossary,
-            4,
+            missingBlocks.length > 0 ? undefined : 6,
             startBlockIdx,
             targetLanguage,
+            missingBlocks.length > 0 ? missingBlocks : undefined,
           );
         } finally {
           setIsPreparingTranslationForAudio(false);
@@ -1159,7 +1215,10 @@ const BookReader = () => {
   );
 
   const handleStartAudioFromChoice = useCallback(
-    async (mode: "resume" | "reading_pos" | "chapter" | "beginning") => {
+    async (
+      mode: "resume" | "reading_pos" | "page" | "chapter" | "beginning",
+      overrideWantTranslated?: boolean,
+    ) => {
       audiobook.unlockAudio();
       if (!book || !bookId) return;
       const structBook = activeReflowBook && activeReflowBook.blocks.length > 0
@@ -1167,14 +1226,46 @@ const BookReader = () => {
         : await ensureStructuredBook();
       if (!structBook || structBook.blocks.length === 0) return;
 
-      const startIdx =
-        mode === "reading_pos"
-          ? currentLocationBlockRef.current.blockIndex
-          : mode === "chapter"
-            ? activeChapters[currentChapterIndex]?.blockIndex ?? 0
-            : 0;
+      const pageItems =
+        mode === "page"
+          ? getPageTextBlocks(
+              structBook,
+              observedDisplayPage,
+              currentLocationBlockRef.current.blockIndex,
+              8,
+            )
+          : [];
 
-      const { audioLang, audioMap } = await resolveAudioLanguageAndMap(structBook, startIdx);
+      const startIdx =
+        mode === "page"
+          ? pageItems[0]?.blockIndex ?? currentLocationBlockRef.current.blockIndex
+          : mode === "reading_pos"
+            ? currentLocationBlockRef.current.blockIndex
+            : mode === "chapter"
+              ? activeChapters[currentChapterIndex]?.blockIndex ?? 0
+              : 0;
+
+      const { audioLang, audioMap } = await resolveAudioLanguageAndMap(
+        structBook,
+        startIdx,
+        overrideWantTranslated,
+        mode === "page" ? pageItems.map((p) => p.block) : undefined,
+      );
+
+      if (mode === "page") {
+        await audiobook.startPagePlayback({
+          bookId,
+          bookTitle: book.title,
+          author: book.author ?? undefined,
+          coverUrl: book.cover_url,
+          reflowBook: structBook,
+          page: observedDisplayPage,
+          language: audioLang,
+          translatedMap: audioMap,
+          fallbackStartBlockIndex: currentLocationBlockRef.current.blockIndex,
+        });
+        return;
+      }
 
       if (mode === "resume" && savedListenProgress) {
         await audiobook.startBookPlayback({
@@ -1186,9 +1277,12 @@ const BookReader = () => {
           language: savedListenProgress.language || audioLang,
           translatedMap: savedListenProgress.language === targetLanguage ? audioMap || translatedMap : audioMap,
           chapterIndex: savedListenProgress.chapterIndex,
+          chapterId: savedListenProgress.chapterId || undefined,
           startBlockId: savedListenProgress.blockId || undefined,
           startSentenceIndex: savedListenProgress.sentenceIndex,
           startPositionSec: savedListenProgress.playbackPosition,
+          scope: "book",
+          page: observedDisplayPage,
         });
         return;
       }
@@ -1204,6 +1298,8 @@ const BookReader = () => {
           translatedMap: audioMap,
           chapterIndex: currentChapterIndex,
           startBlockId: currentLocationBlockRef.current.blockId || undefined,
+          scope: "book",
+          page: observedDisplayPage,
         });
         return;
       }
@@ -1218,6 +1314,8 @@ const BookReader = () => {
           language: audioLang,
           translatedMap: audioMap,
           chapterIndex: currentChapterIndex,
+          scope: "chapter",
+          page: observedDisplayPage,
         });
         return;
       }
@@ -1231,6 +1329,8 @@ const BookReader = () => {
         language: audioLang,
         translatedMap: audioMap,
         chapterIndex: 0,
+        scope: "book",
+        page: 1,
       });
     },
     [
@@ -1238,6 +1338,7 @@ const BookReader = () => {
       bookId,
       ensureStructuredBook,
       activeReflowBook,
+      observedDisplayPage,
       activeChapters,
       currentChapterIndex,
       resolveAudioLanguageAndMap,
@@ -1246,6 +1347,131 @@ const BookReader = () => {
       targetLanguage,
       translatedMap,
     ],
+  );
+
+  const resolveEffectiveTargetLang = useCallback(() => {
+    if (targetLanguage !== sourceLanguage) return targetLanguage;
+    if (
+      audiobook.preferences.preferredTargetLanguage &&
+      audiobook.preferences.preferredTargetLanguage !== sourceLanguage
+    ) {
+      return audiobook.preferences.preferredTargetLanguage;
+    }
+    return sourceLanguage === "en" ? "hi" : "en";
+  }, [targetLanguage, sourceLanguage, audiobook.preferences.preferredTargetLanguage]);
+
+  const handleTranslateQuickText = useCallback(
+    async (text: string) => {
+      const effectiveTargetLang = resolveEffectiveTargetLang();
+      if (effectiveTargetLang !== targetLanguage) {
+        setTargetLanguage(effectiveTargetLang);
+        setHasChosenTranslationLanguage(true);
+        setListenInTranslated(true);
+        audiobook.updatePreferences({
+          preferredTargetLanguage: effectiveTargetLang,
+          preferredTtsLanguage: effectiveTargetLang,
+        });
+      }
+      const res = await translateTextQuick({
+        text,
+        sourceLanguage,
+        targetLanguage: effectiveTargetLang,
+        quality: translationQuality,
+        bookTitle: book?.title,
+        glossary: glossary.slice(0, 8),
+      });
+      return {
+        translatedText: res.translatedText,
+        dir: res.dir,
+        provider: res.provider,
+      };
+    },
+    [
+      resolveEffectiveTargetLang,
+      targetLanguage,
+      sourceLanguage,
+      translationQuality,
+      book?.title,
+      glossary,
+      audiobook,
+    ],
+  );
+
+  const handleSelectionTranslate = useCallback(
+    async (text: string) => {
+      const effectiveTargetLang = resolveEffectiveTargetLang();
+      const res = await handleTranslateQuickText(text);
+      const meta = getLanguageMeta(effectiveTargetLang);
+      return {
+        translatedText: res.translatedText,
+        languageCode: meta.code,
+        languageName: meta.name,
+        nativeName: meta.nativeName,
+        dir: res.dir,
+      };
+    },
+    [resolveEffectiveTargetLang, handleTranslateQuickText],
+  );
+
+  const handleSelectionAudio = useCallback(
+    async (text: string, isTranslated?: boolean, languageOverride?: string) => {
+      audiobook.unlockAudio();
+      if (!book || !bookId || !text.trim()) return;
+      const structBook =
+        activeReflowBook && activeReflowBook.blocks.length > 0
+          ? activeReflowBook
+          : (await ensureStructuredBook()) ?? {
+              bookId,
+              version: 6,
+              meta: {
+                title: book.title,
+                author: book.author ?? undefined,
+                language: sourceLanguage,
+                totalPages: Math.max(1, totalPages),
+                scanned: false,
+                dir: "ltr" as const,
+              },
+              chapters: [],
+              blocks: [],
+            };
+      const lang =
+        languageOverride ||
+        (isTranslated ? resolveEffectiveTargetLang() : sourceLanguage);
+      await audiobook.startSelectionPlayback({
+        bookId,
+        bookTitle: book.title,
+        author: book.author ?? undefined,
+        coverUrl: book.cover_url,
+        reflowBook: structBook,
+        text: text.trim(),
+        language: lang,
+        blockId: currentLocationBlockRef.current.blockId || undefined,
+        blockIndex: currentLocationBlockRef.current.blockIndex,
+        chapterId: activeChapters[currentChapterIndex]?.id,
+        chapterTitle: activeChapters[currentChapterIndex]?.title,
+        page: observedDisplayPage,
+      });
+    },
+    [
+      audiobook,
+      book,
+      bookId,
+      activeReflowBook,
+      ensureStructuredBook,
+      sourceLanguage,
+      totalPages,
+      resolveEffectiveTargetLang,
+      activeChapters,
+      currentChapterIndex,
+      observedDisplayPage,
+    ],
+  );
+
+  const handleListenQuickText = useCallback(
+    async (text: string, languageCode: string) => {
+      await handleSelectionAudio(text, languageCode !== sourceLanguage, languageCode);
+    },
+    [handleSelectionAudio, sourceLanguage],
   );
 
   // Clicking any voice card in Audio Reader immediately applies that voice AND auto-starts book playback in the chosen language
@@ -2495,11 +2721,15 @@ const BookReader = () => {
                         completedChapterIds={completedChapterIds}
                         failedChapterIds={failedChapterIds}
                         currentChapterIndex={currentChapterIndex}
+                        displayPage={displayPage}
                         isTranslating={isTranslating}
                         translationProgress={translationProgress}
                         translationError={translationError}
                         translationErrorCode={translationErrorCode}
                         hasTranslatedSample={Object.keys(translatedMap).length > 0}
+                        initialQuickText={selectedBookText}
+                        onTranslateQuickText={handleTranslateQuickText}
+                        onListenQuickText={(text, lang) => void handleListenQuickText(text, lang)}
                         onTranslateSample={() => void handleTranslateSample()}
                         onTranslateChapter={(idx) => void handleTranslateSingleChapter(idx)}
                         onTranslateFullBook={() => void handleTranslateFullBook()}
@@ -2508,9 +2738,15 @@ const BookReader = () => {
                           setIsTranslating(false);
                         }}
                         onRetryFailed={() => void handleRetryFailedChapters()}
+                        onListenOriginal={() => {
+                          setListenInTranslated(false);
+                          handleSelectSettingsTab("audio");
+                          void handleStartAudioFromChoice("reading_pos", false);
+                        }}
                         onListenTranslated={() => {
                           setListenInTranslated(true);
                           handleSelectSettingsTab("audio");
+                          void handleStartAudioFromChoice("reading_pos", true);
                         }}
                       />
                     </>
@@ -2542,6 +2778,8 @@ const BookReader = () => {
                     listenInTranslated={listenInTranslated}
                     onChangeListenInTranslated={setListenInTranslated}
                     savedListenProgress={savedListenProgress}
+                    selectedExcerptText={selectedBookText}
+                    onStartSelectionAudio={(text, useTr) => void handleSelectionAudio(text, useTr)}
                     onStartChoice={(mode) => void handleStartAudioFromChoice(mode)}
                     onSelectVoiceAndStart={(voiceId) => void handleSelectAndStartVoice(voiceId)}
                     onSyncPageToAudio={() => {
@@ -2959,6 +3197,9 @@ const BookReader = () => {
                     onParagraphAudioClick={(bId) => void handleParagraphAudio(bId)}
                     onParagraphTranslateClick={(bId) => void handleParagraphTranslate(bId)}
                     onCloseInlineTranslation={handleCloseInlineTranslation}
+                    onSelectionChangeText={setSelectedBookText}
+                    onSelectionAudio={(text, isTr, langOv) => void handleSelectionAudio(text, isTr, langOv)}
+                    onSelectionTranslate={handleSelectionTranslate}
                     inlineTranslations={
                       translationReadingMode === "translated" ? originalBlockTextMap : translatedMap
                     }

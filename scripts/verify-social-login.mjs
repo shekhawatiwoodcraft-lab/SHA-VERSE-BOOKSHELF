@@ -35,8 +35,21 @@ function check(label, file, needle) {
   }
 }
 
+function resolveAppId() {
+  for (const cfg of ["capacitor.config.ts", "capacitor.config.json"]) {
+    const cfgPath = path.join(root, cfg);
+    if (!fs.existsSync(cfgPath)) continue;
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    const m = /appId\s*[:=]\s*["']([^"']+)["']/.exec(raw);
+    if (m?.[1]) return m[1];
+  }
+  return "com.shaverse.bookshelf";
+}
+
 function checkManualRegistrationOrder() {
-  const file = "android/app/src/main/java/com/shaverse/app/MainActivity.java";
+  const appId = resolveAppId();
+  const pkgPath = appId.replace(/\./g, "/");
+  const file = `android/app/src/main/java/${pkgPath}/MainActivity.java`;
   const p = path.join(root, file);
   if (!fs.existsSync(p)) {
     bad(`Native fallback registration: MISSING FILE ${file}`);

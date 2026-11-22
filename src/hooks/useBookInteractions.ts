@@ -5,6 +5,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { createIdempotencyKey, recordBookDownload, recordBookView } from "@/lib/analytics/tracking";
 import { isSchemaMissingError } from "@/integrations/supabase/config";
+import { extractStorageObjectPath } from "@/modules/bookshelf/lib/bookDeletion";
 
 export interface BookRating {
   id: string;
@@ -261,7 +262,62 @@ export const useBookInteractions = (bookId?: string) => {
     },
   });
 
-  // Submit deletion request
+  // Permanently delete book immediately (row + storage files + cache cleanup)
+  const deleteBookPermanently = useMutation({
+    mutationFn: async () => {
+      if (!user?.id || !bookId) throw new Error("Not authenticated");
+
+      // Fetch file URLs before deleting the record so storage files can be cleaned up
+      const { data: bookRow } = await supabase
+        .from("books")
+        .select("id, book_url, cover_url")
+        .eq("id", bookId)
+        .maybeSingle();
+
+      const { data: deletedRows, error: deleteError } = await supabase
+        .from("books")
+        .delete()
+        .eq("id", bookId)
+        .select("id");
+
+      if (deleteError) throw deleteError;
+      if (!deletedRows || deletedRows.length === 0) {
+        throw new Error("You do not have permission to delete this book or it no longer exists.");
+      }
+
+      // Best-effort cleanup of uploaded files from the "books" storage bucket
+      const pathsToRemove = [
+        extractStorageObjectPath(bookRow?.book_url, "books"),
+        extractStorageObjectPath(bookRow?.cover_url, "books"),
+      ].filter((p): p is string => Boolean(p));
+
+      if (pathsToRemove.length > 0) {
+        try {
+          await supabase.storage.from("books").remove(pathsToRemove);
+        } catch (storageErr) {
+          console.warn("[useBookInteractions] Storage cleanup skipped:", storageErr);
+        }
+      }
+    },
+    onSuccess: () => {
+      queryClient.removeQueries({ queryKey: ["book", bookId] });
+      queryClient.removeQueries({ queryKey: ["books", "detail", bookId] });
+      queryClient.invalidateQueries({ queryKey: ["books"] });
+      queryClient.invalidateQueries({ queryKey: ["author-books"] });
+      queryClient.invalidateQueries({ queryKey: ["channel-metrics"] });
+      queryClient.invalidateQueries({ queryKey: ["channelMetrics"] });
+      queryClient.invalidateQueries({ queryKey: ["channel-analytics-raw"] });
+      queryClient.invalidateQueries({ queryKey: ["saved-books"] });
+      queryClient.invalidateQueries({ queryKey: ["reading-history"] });
+      toast.success("Book permanently deleted.");
+    },
+    onError: (err) => {
+      const msg = err instanceof Error ? err.message : "Failed to delete book";
+      toast.error(msg);
+    },
+  });
+
+  // Submit deletion request (kept for backward compatibility)
   const submitDeletionRequest = useMutation({
     mutationFn: async ({ reason, description }: { reason: string; description?: string }) => {
       if (!user?.id || !bookId) throw new Error("Not authenticated");
@@ -278,10 +334,10 @@ export const useBookInteractions = (bookId?: string) => {
       if (error) throw error;
     },
     onSuccess: () => {
-      toast.success("Deletion request submitted. Your book will be permanently deleted within 3 hours.");
+      toast.success("Deletion confirmed.");
     },
     onError: () => {
-      toast.error("Failed to submit request");
+      toast.error("Failed to submit deletion confirmation");
     },
   });
 
@@ -330,6 +386,7 @@ export const useBookInteractions = (bookId?: string) => {
     updateProgress,
     incrementDownload,
     incrementView,
+    deleteBookPermanently,
     submitDeletionRequest,
   };
 };

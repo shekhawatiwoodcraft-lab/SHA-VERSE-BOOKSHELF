@@ -7,6 +7,8 @@ import {
   SkipForward,
   RotateCcw,
   RotateCw,
+  ChevronLeft,
+  ChevronRight,
   Volume2,
   Clock,
   ChevronDown,
@@ -45,6 +47,14 @@ function formatClock(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+const SCOPE_LABELS: Record<string, string> = {
+  selection: "Selected Text",
+  paragraph: "Paragraph",
+  page: "Page",
+  chapter: "Chapter",
+  book: "Full Book",
+};
+
 export default function AudiobookPlayer({
   chromeBg,
   textColor,
@@ -55,6 +65,7 @@ export default function AudiobookPlayer({
   const {
     session,
     status,
+    activeEngine,
     error,
     errorCode,
     preferences,
@@ -68,11 +79,17 @@ export default function AudiobookPlayer({
     togglePlayPause,
     pausePlayback,
     stopPlayback,
+    nextSegment,
+    prevSegment,
+    nextPageAudio,
+    prevPageAudio,
     nextChapter,
     prevChapter,
     seekDeltaSeconds,
     jumpToSegmentIndex,
     setVoiceAndApply,
+    setBrowserVoiceAndApply,
+    setAudioEngineAndApply,
     setStyleAndApply,
     updatePreferences,
     setSpeed,
@@ -91,6 +108,12 @@ export default function AudiobookPlayer({
   const langMeta = getLanguageMeta(session.language);
   const segCount = Math.max(1, session.segments.length);
   const progressPct = Math.round(((session.currentSegmentIndex + 1) / segCount) * 100);
+  const totalBookPages = Math.max(1, session.reflowBook.meta.totalPages || 1);
+  const displayAudioPage = activeSegment?.page || session.currentPage || 1;
+  const scopeBadge =
+    session.scope === "page"
+      ? `Page ${displayAudioPage}`
+      : SCOPE_LABELS[session.scope] || "Full Book";
 
   const cycleSpeed = () => {
     const idx = PLAYBACK_SPEEDS.findIndex((s) => Math.abs(s - preferences.preferredSpeed) < 0.05);
@@ -100,6 +123,7 @@ export default function AudiobookPlayer({
 
   return (
     <div
+      data-testid="audiobook-player-dock"
       className={cn(
         "fixed inset-x-0 bottom-0 z-[55] border-t backdrop-blur-md shadow-xl transition-transform duration-200",
       )}
@@ -112,20 +136,28 @@ export default function AudiobookPlayer({
       onClick={(e) => e.stopPropagation()}
     >
       <div className="max-w-3xl mx-auto px-3 sm:px-5 pt-2.5 space-y-2">
-        {/* Top Row: Chapter/Language Metadata + Voice + Sync + Minimize + Close */}
+        {/* Top Row: Chapter/Scope/Engine + Voice + Sync + Minimize + Stop */}
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0 flex-1">
-            <p className="text-xs font-semibold truncate">
-              {currentChapter?.title || session.bookTitle}
-            </p>
+            <div className="flex items-center gap-1.5">
+              <p className="text-xs font-semibold truncate">
+                {session.scope === "selection"
+                  ? "Selected Text Audio"
+                  : currentChapter?.title || session.bookTitle}
+              </p>
+              <span className="shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded border border-current/20 opacity-85">
+                {scopeBadge}
+              </span>
+            </div>
             <p className="text-[11px] opacity-75 truncate">
-              {langMeta.name} ({langMeta.nativeName}) · {preferences.preferredVoice} ·{" "}
-              {session.currentSegmentIndex + 1}/{segCount} segments ({progressPct}%)
+              {langMeta.name} ({langMeta.nativeName}) ·{" "}
+              {activeEngine === "browser" ? "Device Voice (Free)" : preferences.preferredVoice} ·{" "}
+              {session.currentSegmentIndex + 1}/{segCount} ({progressPct}%)
             </p>
           </div>
 
           <div className="flex items-center gap-1 shrink-0">
-            {onSyncTextToAudio && (
+            {onSyncTextToAudio && session.scope !== "selection" && (
               <Button
                 type="button"
                 variant="ghost"
@@ -159,16 +191,19 @@ export default function AudiobookPlayer({
                 )}
               >
                 <SheetHeader>
-                  <SheetTitle>AI Voice &amp; Narration Style</SheetTitle>
+                  <SheetTitle>AI &amp; Device Voice Settings</SheetTitle>
                   <SheetDescription className="sr-only">
-                    Select an AI narrator voice, narration style, and dual-voice dialogue settings.
+                    Select an AI narrator voice, free device voice, narration style, and dialogue settings.
                   </SheetDescription>
                 </SheetHeader>
                 <div className="mt-4">
                   <VoiceLibraryPanel
                     languageCode={session.language}
                     preferences={preferences}
+                    activeEngine={activeEngine}
                     onSelectVoice={setVoiceAndApply}
+                    onSelectBrowserVoice={setBrowserVoiceAndApply}
+                    onChangeAudioEngine={setAudioEngineAndApply}
                     onSelectStyle={setStyleAndApply}
                     onUpdatePreferences={updatePreferences}
                     onBeforePreview={pausePlayback}
@@ -211,7 +246,7 @@ export default function AudiobookPlayer({
               <AlertCircle className="w-3.5 h-3.5 shrink-0" />
               <span className="truncate">
                 {errorCode === "AI_NOT_CONFIGURED"
-                  ? "GEMINI_API_KEY missing in Settings > Secrets."
+                  ? "Studio TTS unavailable; try Free Device Voice in Voice settings."
                   : error}
               </span>
             </div>
@@ -226,21 +261,18 @@ export default function AudiobookPlayer({
             </Button>
           </div>
         ) : activeSegment ? (
-          <p
-            className="text-xs opacity-80 truncate px-0.5"
-            dir={langMeta.dir}
-          >
+          <p className="text-xs opacity-80 truncate px-0.5" dir={langMeta.dir}>
             {activeSegment.text}
           </p>
         ) : null}
 
-        {/* Chapter Scrub Bar */}
+        {/* Segment Scrub Bar */}
         <div className="flex items-center gap-2.5">
           <span className="text-[11px] tabular-nums opacity-70 w-9 text-right shrink-0">
             {formatClock(currentTime)}
           </span>
           <Slider
-            aria-label="Chapter segment progress"
+            aria-label="Segment progress"
             value={[session.currentSegmentIndex]}
             min={0}
             max={Math.max(0, segCount - 1)}
@@ -253,8 +285,8 @@ export default function AudiobookPlayer({
           </span>
         </div>
 
-        {/* Main Transport + Speed + Sleep Timer + Volume */}
-        <div className="flex items-center justify-between gap-2">
+        {/* Main Transport: Prev/Next Chapter, Prev/Next Page, Prev/Next Paragraph, -10s/+10s, Play/Pause */}
+        <div className="flex items-center justify-between gap-1.5 flex-wrap">
           <div className="flex items-center gap-1">
             <Button
               type="button"
@@ -262,7 +294,7 @@ export default function AudiobookPlayer({
               size="sm"
               onClick={cycleSpeed}
               className="h-8 px-2 text-xs font-semibold tabular-nums whitespace-nowrap"
-              title="Playback speed"
+              title="Playback speed (0.5x - 2.0x)"
             >
               {preferences.preferredSpeed}x
             </Button>
@@ -288,18 +320,48 @@ export default function AudiobookPlayer({
             )}
           </div>
 
-          {/* Primary Play / Skip Controls */}
-          <div className="flex items-center gap-1 sm:gap-2">
+          <div className="flex items-center gap-0.5 sm:gap-1">
+            {session.scope !== "selection" && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Previous chapter"
+                title="Previous chapter"
+                disabled={session.currentChapterIndex <= 0}
+                onClick={prevChapter}
+                className="h-8 w-8 hidden sm:inline-flex"
+              >
+                <SkipBack className="w-4 h-4" />
+              </Button>
+            )}
+
+            {session.scope !== "selection" && totalBookPages > 1 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label="Previous page audio"
+                title="Previous page"
+                disabled={displayAudioPage <= 1}
+                onClick={prevPageAudio}
+                className="h-8 px-1.5 text-[11px]"
+              >
+                Pg-
+              </Button>
+            )}
+
             <Button
               type="button"
               variant="ghost"
               size="icon"
-              aria-label="Previous chapter"
-              disabled={session.currentChapterIndex <= 0}
-              onClick={prevChapter}
-              className="h-9 w-9"
+              aria-label="Previous paragraph"
+              title="Previous paragraph"
+              disabled={session.currentSegmentIndex <= 0 && session.currentChapterIndex <= 0}
+              onClick={prevSegment}
+              className="h-8 w-8"
             >
-              <SkipBack className="w-4 h-4" />
+              <ChevronLeft className="w-4 h-4" />
             </Button>
 
             <Button
@@ -308,10 +370,10 @@ export default function AudiobookPlayer({
               size="icon"
               aria-label="Rewind 10 seconds"
               onClick={() => seekDeltaSeconds(-10)}
-              className="h-9 w-9 relative"
+              className="h-8 w-8"
               title="-10s"
             >
-              <RotateCcw className="w-4 h-4" />
+              <RotateCcw className="w-3.5 h-3.5" />
             </Button>
 
             <Button
@@ -319,7 +381,7 @@ export default function AudiobookPlayer({
               size="icon"
               aria-label={status === "playing" ? "Pause audiobook" : "Play audiobook"}
               onClick={togglePlayPause}
-              className="h-11 w-11 rounded-full shrink-0"
+              className="h-10 w-10 rounded-full shrink-0"
             >
               {status === "loading" ? (
                 <Loader2 className="w-5 h-5 animate-spin" />
@@ -336,27 +398,61 @@ export default function AudiobookPlayer({
               size="icon"
               aria-label="Forward 10 seconds"
               onClick={() => seekDeltaSeconds(10)}
-              className="h-9 w-9"
+              className="h-8 w-8"
               title="+10s"
             >
-              <RotateCw className="w-4 h-4" />
+              <RotateCw className="w-3.5 h-3.5" />
             </Button>
 
             <Button
               type="button"
               variant="ghost"
               size="icon"
-              aria-label="Next chapter"
-              disabled={session.currentChapterIndex >= session.chapters.length - 1}
-              onClick={nextChapter}
-              className="h-9 w-9"
+              aria-label="Next paragraph"
+              title="Next paragraph"
+              disabled={
+                session.currentSegmentIndex >= session.segments.length - 1 &&
+                session.currentChapterIndex >= session.chapters.length - 1
+              }
+              onClick={nextSegment}
+              className="h-8 w-8"
             >
-              <SkipForward className="w-4 h-4" />
+              <ChevronRight className="w-4 h-4" />
             </Button>
+
+            {session.scope !== "selection" && totalBookPages > 1 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label="Next page audio"
+                title="Next page"
+                disabled={displayAudioPage >= totalBookPages}
+                onClick={nextPageAudio}
+                className="h-8 px-1.5 text-[11px]"
+              >
+                Pg+
+              </Button>
+            )}
+
+            {session.scope !== "selection" && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Next chapter"
+                title="Next chapter"
+                disabled={session.currentChapterIndex >= session.chapters.length - 1}
+                onClick={nextChapter}
+                className="h-8 w-8 hidden sm:inline-flex"
+              >
+                <SkipForward className="w-4 h-4" />
+              </Button>
+            )}
           </div>
 
-          {/* Desktop Volume Control */}
-          <div className="hidden sm:flex items-center gap-1.5 w-24 shrink-0">
+          {/* Volume Control (available on mobile + desktop) */}
+          <div className="flex items-center gap-1.5 w-20 sm:w-24 shrink-0">
             <Volume2 className="w-3.5 h-3.5 opacity-70 shrink-0" />
             <Slider
               aria-label="Audio volume"

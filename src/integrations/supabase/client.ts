@@ -8,8 +8,10 @@ export const SUPABASE_ENABLED = true;
 
 const { url: resolvedUrl, publishableKey: resolvedKey, projectRef: activeProjectRef } =
   resolveSupabaseConfig({
-    url: import.meta.env.VITE_SUPABASE_URL,
-    key: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+    url: import.meta.env.VITE_SUPABASE_URL || import.meta.env.NEXT_PUBLIC_SUPABASE_URL,
+    key:
+      import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+      import.meta.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
   });
 
 export const SUPABASE_URL = SUPABASE_ENABLED ? resolvedUrl : "";

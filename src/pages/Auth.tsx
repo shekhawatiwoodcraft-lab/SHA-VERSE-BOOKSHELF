@@ -10,11 +10,17 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp";
 import { z } from "zod";
-import { Loader2, Mail, Phone, ArrowLeft, Eye, EyeOff } from "lucide-react";
+import { Loader2, Mail, Phone, ArrowLeft, Eye, EyeOff, AlertCircle, CheckCircle2 } from "lucide-react";
 import { SEO } from "@/components/seo/SEO";
 import AppLogoStatusRing from "@/components/promotions/AppLogoStatusRing";
 import { shouldUseNativeGoogle, nativeGoogleSignIn, nativeGoogleDiagnostics } from "@/lib/auth/nativeGoogleAuth";
 import { useAuth } from "@/contexts/AuthContext";
+import {
+  classifySignUpOutcome,
+  extractOAuthErrorFromLocation,
+  formatAuthErrorMessage,
+  normalizeAuthEmail,
+} from "@/modules/auth/lib/authHelpers";
 
 // Validation schemas
 const emailSchema = z.object({
@@ -31,7 +37,7 @@ const signupSchema = emailSchema.extend({
   displayName: z.string().min(2, "Display name must be at least 2 characters"),
 });
 
-type AuthMethod = "email" | "phone" | "otp-verify";
+type AuthMethod = "email" | "phone" | "otp-verify" | "forgot-password" | "reset-password";
 
 // Toggle "Login with mobile no" (Phone OTP) visibility.
 // Set to true to re-enable the Phone tab when requested.
@@ -42,6 +48,7 @@ const Auth = () => {
   const [authMethod, setAuthMethod] = useState<AuthMethod>("email");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [phone, setPhone] = useState("");
@@ -49,17 +56,47 @@ const Auth = () => {
   const [loading, setLoading] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const [showPassword, setShowPassword] = useState(false);
+  const [authErrorBanner, setAuthErrorBanner] = useState<string | null>(null);
+  const [authSuccessBanner, setAuthSuccessBanner] = useState<string | null>(null);
+  const [pendingVerificationEmail, setPendingVerificationEmail] = useState<string | null>(null);
+  const [resendingEmail, setResendingEmail] = useState(false);
   const navigate = useNavigate();
   const { toast } = useToast();
   const { user } = useAuth();
 
-  // If the user is already authenticated (e.g. after the post-login fresh-app
-  // reload lands back on /auth), bounce them home instead of showing the login
-  // form. This fixes the "first email login appears logged out" race where the
-  // forced reload fired before navigation completed.
+  // Detect password recovery mode via query param or Supabase auth event
   useEffect(() => {
-    if (user) navigate("/", { replace: true });
-  }, [user, navigate]);
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      if (params.get("mode") === "reset" || hashParams.get("type") === "recovery") {
+        setAuthMethod("reset-password");
+      }
+    }
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
+      if (event === "PASSWORD_RECOVERY") {
+        setAuthMethod("reset-password");
+      }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // If the user is already authenticated (and NOT completing password recovery),
+  // bounce them home instead of showing the login form.
+  useEffect(() => {
+    if (user && authMethod !== "reset-password") navigate("/", { replace: true });
+  }, [user, navigate, authMethod]);
+
+  // Surface any OAuth redirect errors (e.g. Google Consent Screen testing mode / DB trigger errors)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const oauthErr = extractOAuthErrorFromLocation(window.location.search, window.location.hash);
+    if (oauthErr) {
+      setAuthErrorBanner(oauthErr);
+      toast({ title: "Sign-In Issue", description: oauthErr, variant: "destructive" });
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [toast]);
 
   // Countdown timer for OTP resend
   useEffect(() => {
@@ -87,52 +124,119 @@ const Auth = () => {
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    setAuthErrorBanner(null);
+
+    const trimmedEmail = normalizeAuthEmail(email);
+    const trimmedUsername = username.trim();
+    const trimmedDisplayName = displayName.trim();
 
     try {
-      const data = isLogin ? { email, password } : { email, password, username, displayName };
-
       if (isLogin) {
-        emailSchema.parse({ email, password });
+        emailSchema.parse({ email: trimmedEmail, password });
       } else {
-        signupSchema.parse(data);
+        signupSchema.parse({
+          email: trimmedEmail,
+          password,
+          username: trimmedUsername,
+          displayName: trimmedDisplayName,
+        });
       }
 
       if (isLogin) {
-        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        const { error } = await supabase.auth.signInWithPassword({
+          email: trimmedEmail,
+          password,
+        });
         if (error) throw error;
-        void logAttempt(email, "email", true);
+        setPendingVerificationEmail(null);
+        void logAttempt(trimmedEmail, "email", true);
         toast({ title: "Welcome back!", description: "Successfully logged in" });
         navigate("/");
       } else {
-        const { error } = await supabase.auth.signUp({
-          email,
+        const { data: signUpData, error } = await supabase.auth.signUp({
+          email: trimmedEmail,
           password,
           options: {
-            data: { username, display_name: displayName },
+            data: {
+              username: trimmedUsername,
+              display_name: trimmedDisplayName,
+            },
             emailRedirectTo: `${window.location.origin}/`,
           },
         });
         if (error) throw error;
-        await logAttempt(email, "email", true);
-        toast({ title: "Account created!", description: "Please check your email to verify your account" });
-        navigate("/");
+
+        await logAttempt(trimmedEmail, "email", true);
+        const outcome = classifySignUpOutcome(signUpData);
+
+        if (outcome === "signed_in") {
+          setPendingVerificationEmail(null);
+          toast({ title: "Account created!", description: "Welcome to Sha-Verse!" });
+          navigate("/");
+        } else if (outcome === "already_registered_unconfirmed") {
+          setPendingVerificationEmail(trimmedEmail);
+          setIsLogin(true);
+          const msg =
+            "Yeh email pehle se registered hai. Agar verify nahi hui to neeche 'Resend Verification Email' dabayein, ya Sign In karein.";
+          setAuthErrorBanner(msg);
+          toast({ title: "Account Already Exists", description: msg });
+        } else {
+          setPendingVerificationEmail(trimmedEmail);
+          setIsLogin(true);
+          toast({
+            title: "Account created! Verify email",
+            description: `${trimmedEmail} par verification link bheja gaya hai. Verify karke Sign In karein.`,
+          });
+        }
       }
     } catch (error: unknown) {
-      await logAttempt(email, "email", false);
+      await logAttempt(trimmedEmail || email, "email", false);
       if (error instanceof z.ZodError) {
-        toast({ title: "Validation Error", description: error.errors[0].message, variant: "destructive" });
+        const msg = error.errors[0].message;
+        setAuthErrorBanner(msg);
+        toast({ title: "Validation Error", description: msg, variant: "destructive" });
       } else {
-        const msg = error instanceof Error ? error.message : String(error || "An error occurred");
-        toast({ title: "Error", description: msg, variant: "destructive" });
+        const formatted = formatAuthErrorMessage(error);
+        setAuthErrorBanner(formatted.message);
+        if (formatted.isEmailNotConfirmed && trimmedEmail) {
+          setPendingVerificationEmail(trimmedEmail);
+        }
+        toast({ title: "Login Error", description: formatted.message, variant: "destructive" });
       }
     } finally {
       setLoading(false);
     }
   };
 
+  const handleResendVerification = async () => {
+    if (!pendingVerificationEmail || resendingEmail) return;
+    setResendingEmail(true);
+    try {
+      const { error } = await supabase.auth.resend({
+        type: "signup",
+        email: pendingVerificationEmail,
+        options: {
+          emailRedirectTo: `${window.location.origin}/`,
+        },
+      });
+      if (error) throw error;
+      toast({
+        title: "Verification Email Sent",
+        description: `${pendingVerificationEmail} ka inbox aur Spam folder check karein.`,
+      });
+    } catch (error: unknown) {
+      const formatted = formatAuthErrorMessage(error);
+      setAuthErrorBanner(formatted.message);
+      toast({ title: "Resend Failed", description: formatted.message, variant: "destructive" });
+    } finally {
+      setResendingEmail(false);
+    }
+  };
+
   // Google OAuth
   const handleGoogleAuth = async () => {
     setLoading(true);
+    setAuthErrorBanner(null);
     try {
       // Native app (Android/iOS): use native Google account picker → idToken.
       // This avoids the /~oauth webview redirect that 404s in standalone builds.
@@ -173,10 +277,12 @@ const Auth = () => {
           if (settingsRes.ok) {
             const settings = (await settingsRes.json()) as { external?: { google?: boolean } };
             if (settings?.external?.google === false) {
+              const msg =
+                "Google Sign-In abhi Supabase me save nahi hua hai. Supabase → Authentication → Providers → Google me Client ID aur Client Secret paste karke Save karein.";
+              setAuthErrorBanner(msg);
               toast({
-                title: "Google Sign-In Not Enabled Yet",
-                description:
-                  "Supabase Dashboard → Authentication → Providers → Google enable karein, ya abhi Email se Sign In/Sign Up karein.",
+                title: "Google Sign-In Not Saved Yet",
+                description: msg,
                 variant: "destructive",
               });
               setLoading(false);
@@ -201,12 +307,9 @@ const Auth = () => {
 
       if (error) throw error;
     } catch (error: unknown) {
-      const errObj = error as { message?: string } | undefined;
-      const rawMessage = String(errObj?.message || (error instanceof Error ? error.message : "") || "Failed to sign in with Google");
-      const friendlyMessage = /unsupported provider|provider is not enabled/i.test(rawMessage)
-        ? "Google login is not enabled yet in Supabase (Authentication → Providers → Google). Use Email login or enable Google in Supabase Dashboard."
-        : rawMessage;
-      toast({ title: "Google Sign-In", description: friendlyMessage, variant: "destructive" });
+      const formatted = formatAuthErrorMessage(error);
+      setAuthErrorBanner(formatted.message);
+      toast({ title: "Google Sign-In", description: formatted.message, variant: "destructive" });
       setLoading(false);
     }
   };
@@ -285,6 +388,68 @@ const Auth = () => {
   const resetToMethodSelection = () => {
     setAuthMethod("email");
     setOtp("");
+    setAuthErrorBanner(null);
+    setAuthSuccessBanner(null);
+  };
+
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setAuthErrorBanner(null);
+    setAuthSuccessBanner(null);
+    const trimmedEmail = normalizeAuthEmail(email);
+
+    try {
+      z.string().email("Please enter a valid email address").parse(trimmedEmail);
+      const { error } = await supabase.auth.resetPasswordForEmail(trimmedEmail, {
+        redirectTo: `${window.location.origin}/auth?mode=reset`,
+      });
+      if (error) throw error;
+      const msg = `Password reset link sent to ${trimmedEmail}. Inbox aur Spam folder check karein.`;
+      setAuthSuccessBanner(msg);
+      toast({ title: "Reset Link Sent", description: msg });
+    } catch (error: unknown) {
+      const msg =
+        error instanceof z.ZodError
+          ? error.errors[0].message
+          : formatAuthErrorMessage(error).message;
+      setAuthErrorBanner(msg);
+      toast({ title: "Reset Request Failed", description: msg, variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCompletePasswordReset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setAuthErrorBanner(null);
+    setAuthSuccessBanner(null);
+
+    try {
+      if (password.length < 6) {
+        throw new Error("New password must be at least 6 characters.");
+      }
+      if (password !== confirmNewPassword) {
+        throw new Error("Passwords do not match.");
+      }
+      const { error } = await supabase.auth.updateUser({ password });
+      if (error) throw error;
+      toast({
+        title: "Password Updated",
+        description: "Your password has been updated successfully.",
+      });
+      setPassword("");
+      setConfirmNewPassword("");
+      setAuthMethod("email");
+      navigate("/", { replace: true });
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : formatAuthErrorMessage(error).message;
+      setAuthErrorBanner(msg);
+      toast({ title: "Password Reset Failed", description: msg, variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -305,12 +470,165 @@ const Auth = () => {
               </h1>
             </div>
             <p className="text-sm sm:text-base text-muted-foreground">
-              {authMethod === "otp-verify" ? "Verify your phone" : isLogin ? "Welcome back!" : "Create your account"}
+              {authMethod === "otp-verify"
+                ? "Verify your phone"
+                : authMethod === "forgot-password"
+                  ? "Reset your password"
+                  : authMethod === "reset-password"
+                    ? "Set a new password"
+                    : isLogin
+                      ? "Welcome back!"
+                      : "Create your account"}
             </p>
           </div>
 
-          {/* OTP Verification Screen */}
-          {authMethod === "otp-verify" ? (
+          {authSuccessBanner && (
+            <div
+              role="status"
+              className="mb-4 flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs sm:text-sm text-emerald-700 dark:text-emerald-300"
+            >
+              <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{authSuccessBanner}</span>
+            </div>
+          )}
+
+          {pendingVerificationEmail && (
+            <div
+              role="status"
+              className="mb-4 rounded-lg border border-primary/30 bg-primary/5 p-3.5 text-xs sm:text-sm space-y-2.5"
+            >
+              <div className="flex items-start gap-2">
+                <CheckCircle2 className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-medium text-foreground">
+                    Email verification pending ({pendingVerificationEmail})
+                  </p>
+                  <p className="text-muted-foreground">
+                    Inbox ya Spam folder me verification link par click karein, fir Sign In karein.
+                  </p>
+                </div>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleResendVerification}
+                disabled={resendingEmail}
+                className="w-full"
+              >
+                {resendingEmail ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />
+                    Sending...
+                  </>
+                ) : (
+                  "Resend Verification Email"
+                )}
+              </Button>
+            </div>
+          )}
+
+          {authErrorBanner && (
+            <div
+              role="alert"
+              className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-xs sm:text-sm text-destructive"
+            >
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span>{authErrorBanner}</span>
+            </div>
+          )}
+
+          {/* Forgot Password Screen */}
+          {authMethod === "forgot-password" ? (
+            <form onSubmit={handleForgotPassword} className="space-y-4">
+              <button
+                type="button"
+                onClick={resetToMethodSelection}
+                className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors touch-target"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                Back to Sign In
+              </button>
+              <div className="space-y-2">
+                <Label htmlFor="reset-email" className="text-sm">
+                  Account Email
+                </Label>
+                <Input
+                  id="reset-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  className="input-mobile bg-secondary"
+                  placeholder="you@example.com"
+                  autoComplete="email"
+                />
+              </div>
+              <Button
+                type="submit"
+                className="w-full bg-gradient-primary shadow-glow touch-target-lg h-12"
+                disabled={loading}
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                    Sending link...
+                  </>
+                ) : (
+                  "Send Reset Link"
+                )}
+              </Button>
+            </form>
+          ) : authMethod === "reset-password" ? (
+            <form onSubmit={handleCompletePasswordReset} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="new-password" className="text-sm">
+                  New Password
+                </Label>
+                <Input
+                  id="new-password"
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  required
+                  minLength={6}
+                  className="input-mobile bg-secondary"
+                  placeholder="At least 6 characters"
+                  autoComplete="new-password"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="confirm-new-password" className="text-sm">
+                  Confirm New Password
+                </Label>
+                <Input
+                  id="confirm-new-password"
+                  type={showPassword ? "text" : "password"}
+                  value={confirmNewPassword}
+                  onChange={(e) => setConfirmNewPassword(e.target.value)}
+                  required
+                  minLength={6}
+                  className="input-mobile bg-secondary"
+                  placeholder="Re-enter new password"
+                  autoComplete="new-password"
+                />
+              </div>
+              <Button
+                type="submit"
+                className="w-full bg-gradient-primary shadow-glow touch-target-lg h-12"
+                disabled={loading}
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                    Updating password...
+                  </>
+                ) : (
+                  "Update Password"
+                )}
+              </Button>
+            </form>
+          ) : authMethod === "otp-verify" ? (
             <div className="space-y-6">
               <button
                 onClick={resetToMethodSelection}
@@ -466,6 +784,21 @@ const Auth = () => {
                           {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                         </button>
                       </div>
+                      {isLogin && (
+                        <div className="flex justify-end pt-0.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAuthErrorBanner(null);
+                              setAuthSuccessBanner(null);
+                              setAuthMethod("forgot-password");
+                            }}
+                            className="text-xs text-primary hover:underline"
+                          >
+                            Forgot password?
+                          </button>
+                        </div>
+                      )}
                     </div>
 
                     <Button
@@ -573,7 +906,10 @@ const Auth = () => {
               {/* Toggle Login/Signup */}
               <div className="mt-6 text-center">
                 <button
-                  onClick={() => setIsLogin(!isLogin)}
+                  onClick={() => {
+                    setAuthErrorBanner(null);
+                    setIsLogin(!isLogin);
+                  }}
                   className="text-sm text-muted-foreground hover:text-foreground transition-colors touch-target py-2"
                 >
                   {isLogin ? "Don't have an account? Sign up" : "Already have an account? Sign in"}

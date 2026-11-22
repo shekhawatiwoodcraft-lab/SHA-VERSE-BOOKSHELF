@@ -569,6 +569,7 @@ const BookDetailPage = () => {
         onOpenChange={setShowDeletionDialog}
         bookId={id || ''}
         bookTitle={book.title}
+        onDeleted={() => navigate("/bookshelf", { replace: true })}
       />
 
       <BookReportDialog

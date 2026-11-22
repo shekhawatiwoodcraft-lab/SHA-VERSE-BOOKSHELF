@@ -16,17 +16,57 @@ import {
   parseModelJson,
   validateTranslationBatch,
 } from "./src/lib/ai/segments";
+import {
+  detectScriptLanguage,
+  translateBlocksFree,
+  translateSingleTextFreeGtx,
+} from "./src/lib/ai/freeTranslate";
 import { resolveSupabaseConfig } from "./src/integrations/supabase/config";
+import { verifyJwtWithJwks, type JwkKeyRecord } from "./src/lib/ai/jwtVerify";
 
 const PORT = Number(process.env.PORT || 3000);
 const SUPABASE_ENABLED = true;
 const resolvedSupabase = resolveSupabaseConfig({
-  url: process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL,
-  key: process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+  url:
+    process.env.SUPABASE_URL ||
+    process.env.VITE_SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+  key:
+    process.env.SUPABASE_PUBLISHABLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+  jwksUrl: process.env.SUPABASE_JWKS_URL,
 });
 const SUPABASE_URL = SUPABASE_ENABLED ? resolvedSupabase.url : "";
 const SUPABASE_ANON_KEY = SUPABASE_ENABLED ? resolvedSupabase.publishableKey : "";
+const SUPABASE_JWKS_URL = SUPABASE_ENABLED ? resolvedSupabase.jwksUrl : "";
 const SUPABASE_AUTH_CONFIGURED = Boolean(SUPABASE_ENABLED && SUPABASE_URL && SUPABASE_ANON_KEY);
+
+let cachedJwks: { keys: JwkKeyRecord[]; expiresAt: number } | null = null;
+
+async function getSupabaseJwks(): Promise<JwkKeyRecord[]> {
+  const now = Date.now();
+  if (cachedJwks && cachedJwks.expiresAt > now) {
+    return cachedJwks.keys;
+  }
+  if (!SUPABASE_JWKS_URL) return [];
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(SUPABASE_JWKS_URL, { signal: controller.signal });
+    clearTimeout(timer);
+    if (resp.ok) {
+      const body = (await resp.json()) as { keys?: JwkKeyRecord[] };
+      const keys = Array.isArray(body?.keys) ? body.keys : [];
+      cachedJwks = { keys, expiresAt: now + 10 * 60_000 };
+      return keys;
+    }
+  } catch {
+    // Fallback to /auth/v1/user verification if JWKS fetch fails
+  }
+  return cachedJwks?.keys ?? [];
+}
 
 const FAST_TRANSLATION_MODEL = "gemini-3.1-flash-lite";
 const TRANSLATION_MODEL = "gemini-4-hydrogen";
@@ -49,18 +89,22 @@ const verifiedAuthCache = new Map<string, { callerId: string; expiresAt: number 
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQ = 150;
+const GUEST_RATE_LIMIT_MAX_REQ = 70;
 
-function checkRateLimit(key: string): boolean {
+function checkRateLimit(key: string, maxReq = RATE_LIMIT_MAX_REQ): boolean {
   const now = Date.now();
   const bucket = rateBuckets.get(key);
   if (!bucket || bucket.resetAt <= now) {
     rateBuckets.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
     return true;
   }
-  if (bucket.count >= RATE_LIMIT_MAX_REQ) return false;
+  if (bucket.count >= maxReq) return false;
   bucket.count += 1;
   return true;
 }
+
+let geminiTranslateCooldownUntil = 0;
+let geminiTtsCooldownUntil = 0;
 
 function getGenAiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
@@ -69,7 +113,7 @@ function getGenAiClient(): GoogleGenAI | null {
     apiKey,
     apiVersion: "v1beta",
     httpOptions: {
-      timeout: 30_000,
+      timeout: 12_000,
       headers: {
         "User-Agent": "aistudio-build",
       },
@@ -149,21 +193,23 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise<T> {
   throw lastErr;
 }
 
-async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: string; status?: number; message?: string }> {
+async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: string; isGuest?: boolean; status?: number; message?: string }> {
   const authHeader = req.headers.authorization || "";
+  const guestId = `anon-${sha256(req.ip || "local").slice(0, 12)}`;
+
   if (!SUPABASE_AUTH_CONFIGURED) {
-    // Disconnected from legacy Supabase: identify caller safely for rate-limiting without calling external auth.
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-    const callerKey = token ? sha256(token).slice(0, 12) : `anon-${sha256(req.ip || "local").slice(0, 12)}`;
-    return { ok: true, callerId: callerKey };
+    const callerKey = token ? sha256(token).slice(0, 12) : guestId;
+    return { ok: true, callerId: callerKey, isGuest: !token };
   }
 
+  // Allow public/guest readers to translate & listen safely using IP-scoped rate limit
   if (!authHeader.startsWith("Bearer ")) {
-    return { ok: false, callerId: "anon", status: 401, message: "Authentication required for AI reading features." };
+    return { ok: true, callerId: guestId, isGuest: true };
   }
   const token = authHeader.slice(7).trim();
   if (!token) {
-    return { ok: false, callerId: "anon", status: 401, message: "Missing authentication token." };
+    return { ok: true, callerId: guestId, isGuest: true };
   }
 
   const tokenHash = sha256(token);
@@ -176,7 +222,30 @@ async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: 
     verifiedAuthCache.delete(tokenHash);
   }
 
-  // Verify token against configured Auth server when reachable
+  // 1) Fast local JWKS verification for asymmetric Supabase JWTs (ES256/RS256)
+  try {
+    const jwks = await getSupabaseJwks();
+    if (jwks.length > 0) {
+      const jwksCheck = verifyJwtWithJwks(token, jwks);
+      if (jwksCheck.valid && jwksCheck.claims?.sub) {
+        const callerId = jwksCheck.claims.sub;
+        setBoundedCache(
+          verifiedAuthCache,
+          tokenHash,
+          { callerId, expiresAt: now + AUTH_CACHE_TTL_MS },
+          MAX_AUTH_CACHE,
+        );
+        return { ok: true, callerId };
+      }
+      if (jwksCheck.reason === "token_expired") {
+        return { ok: true, callerId: guestId, isGuest: true };
+      }
+    }
+  } catch {
+    // Continue to Auth API verification fallback
+  }
+
+  // 2) Verify token against configured Supabase Auth server when reachable
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
@@ -202,7 +271,7 @@ async function verifyCallerAuth(req: Request): Promise<{ ok: boolean; callerId: 
     }
     if (resp.status === 401 || resp.status === 403) {
       verifiedAuthCache.delete(tokenHash);
-      return { ok: false, callerId: "invalid", status: 401, message: "Session expired or invalid. Please sign in again." };
+      return { ok: true, callerId: guestId, isGuest: true };
     }
   } catch {
     // Transient network drop to auth server: rate-limit by hashed token instead of failing offline-capable previews
@@ -246,6 +315,11 @@ async function startServer() {
     const configured = Boolean(getGenAiClient());
     res.json({
       configured,
+      freeFallbackAvailable: true,
+      supabase: {
+        configured: SUPABASE_AUTH_CONFIGURED,
+        projectRef: resolvedSupabase.projectRef,
+      },
       models: {
         translation: FAST_TRANSLATION_MODEL,
         tts: TTS_STANDARD_MODEL,
@@ -256,6 +330,88 @@ async function startServer() {
         maxCharsPerTtsSegment: 1600,
       },
     });
+  });
+
+  // Standardized REST API health & ISBN metadata lookup proxy
+  app.get("/api/v1/health", (_req: Request, res: Response) => {
+    res.json({
+      ok: true,
+      service: "sha-verse-bookshelf",
+      supabaseConfigured: SUPABASE_AUTH_CONFIGURED,
+      projectRef: resolvedSupabase.projectRef,
+      aiConfigured: Boolean(getGenAiClient()),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get("/api/v1/books/lookup-isbn/:isbn", async (req: Request, res: Response) => {
+    const callerKey = sha256(req.ip || "local").slice(0, 12);
+    if (!checkRateLimit(`isbn:${callerKey}`)) {
+      return res.status(429).json({ error: "Too many ISBN lookup requests. Please wait a moment." });
+    }
+    const cleanIsbn = String(req.params.isbn || "").replace(/[^0-9Xx]/g, "").toUpperCase();
+    if (!/^(?:\d{9}[\dX]|\d{13})$/.test(cleanIsbn)) {
+      return res.status(400).json({ error: "Please enter a valid 10-digit or 13-digit ISBN." });
+    }
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const url = `https://openlibrary.org/api/books?bibkeys=ISBN:${encodeURIComponent(cleanIsbn)}&format=json&jscmd=data`;
+      const resp = await fetch(url, {
+        headers: { "User-Agent": "Sha-Verse-Bookshelf/1.0" },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (!resp.ok) {
+        return res.status(502).json({ error: "ISBN metadata provider returned an error." });
+      }
+      const payload = (await resp.json()) as Record<
+        string,
+        {
+          title?: string;
+          subtitle?: string;
+          authors?: Array<{ name?: string }>;
+          publishers?: Array<{ name?: string }>;
+          publish_date?: string;
+          number_of_pages?: number;
+          cover?: { large?: string; medium?: string; small?: string };
+          notes?: string | { value?: string };
+          subjects?: Array<{ name?: string }>;
+        }
+      >;
+      const record = payload[`ISBN:${cleanIsbn}`];
+      if (!record) {
+        return res.status(404).json({ error: `No book metadata found for ISBN ${cleanIsbn}.` });
+      }
+
+      const description =
+        typeof record.notes === "string"
+          ? record.notes
+          : typeof record.notes?.value === "string"
+            ? record.notes.value
+            : "";
+
+      return res.json({
+        isbn: cleanIsbn,
+        title: record.title || "",
+        subtitle: record.subtitle || "",
+        author: Array.isArray(record.authors)
+          ? record.authors.map((a) => a.name).filter(Boolean).join(", ")
+          : "",
+        publisher: Array.isArray(record.publishers) && record.publishers[0]?.name ? record.publishers[0].name : "",
+        publicationDate: record.publish_date || "",
+        pages: typeof record.number_of_pages === "number" ? record.number_of_pages : undefined,
+        coverUrl: record.cover?.large || record.cover?.medium || record.cover?.small || "",
+        description,
+        subjects: Array.isArray(record.subjects)
+          ? record.subjects.slice(0, 6).map((s) => s.name).filter(Boolean)
+          : [],
+      });
+    } catch {
+      return res.status(504).json({ error: "ISBN lookup timed out. Please try again or enter details manually." });
+    }
   });
 
   app.get("/api/ai/voices", (_req: Request, res: Response) => {
@@ -269,16 +425,8 @@ async function startServer() {
   app.post("/api/ai/detect-language", async (req: Request, res: Response) => {
     const auth = await verifyCallerAuth(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.message });
-    if (!checkRateLimit(auth.callerId)) {
+    if (!checkRateLimit(auth.callerId, auth.isGuest ? GUEST_RATE_LIMIT_MAX_REQ : RATE_LIMIT_MAX_REQ)) {
       return res.status(429).json({ error: "Too many requests. Please slow down.", code: "RATE_LIMITED" });
-    }
-
-    const ai = getGenAiClient();
-    if (!ai) {
-      return res.status(503).json({
-        error: "AI service requires a GEMINI_API_KEY configured in Settings > Secrets.",
-        code: "AI_NOT_CONFIGURED",
-      });
     }
 
     const sampleText = typeof req.body?.sampleText === "string" ? req.body.sampleText.trim().slice(0, 2200) : "";
@@ -286,59 +434,83 @@ async function startServer() {
       return res.status(400).json({ error: "sampleText is required." });
     }
 
-    try {
-      const response = await withRetry(() =>
-        ai.models.generateContent({
-          model: FAST_TRANSLATION_MODEL,
-          contents: `Detect the primary language of this book excerpt and return its ISO 639-1 code (e.g., en, hi, ur, ar, bn, es, fr, de, pt, zh, ja, ko, ru, tr, id).\n\nExcerpt:\n${sampleText}`,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                languageCode: { type: Type.STRING },
-                languageName: { type: Type.STRING },
-                confidence: { type: Type.NUMBER },
+    const ai = getGenAiClient();
+    if (ai) {
+      try {
+        const response = await withRetry(() =>
+          ai.models.generateContent({
+            model: FAST_TRANSLATION_MODEL,
+            contents: `Detect the primary language of this book excerpt and return its ISO 639-1 code (e.g., en, hi, ur, ar, bn, es, fr, de, pt, zh, ja, ko, ru, tr, id).\n\nExcerpt:\n${sampleText}`,
+            config: {
+              thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  languageCode: { type: Type.STRING },
+                  languageName: { type: Type.STRING },
+                  confidence: { type: Type.NUMBER },
+                },
+                required: ["languageCode", "languageName", "confidence"],
               },
-              required: ["languageCode", "languageName", "confidence"],
             },
-          },
-        }),
-      );
+          }),
+        );
 
-      const parsed = parseModelJson<{
-        languageCode?: string;
-        languageName?: string;
-        confidence?: number;
-      }>(response.text || "{}");
-      const meta = getLanguageMeta(parsed.languageCode || "en");
-      res.json({
-        languageCode: meta.code,
-        languageName: parsed.languageName || meta.name,
-        nativeName: meta.nativeName,
-        dir: meta.dir,
-        confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.9,
-      });
-    } catch (err) {
-      const mapped = mapAiError(err);
-      res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
+        const parsed = parseModelJson<{
+          languageCode?: string;
+          languageName?: string;
+          confidence?: number;
+        }>(response.text || "{}");
+        const meta = getLanguageMeta(parsed.languageCode || "en");
+        return res.json({
+          languageCode: meta.code,
+          languageName: parsed.languageName || meta.name,
+          nativeName: meta.nativeName,
+          dir: meta.dir,
+          confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.9,
+          provider: "gemini",
+        });
+      } catch {
+        // Fall through to free/local language detection
+      }
     }
+
+    const scriptGuess = detectScriptLanguage(sampleText);
+    let resolvedCode = scriptGuess.languageCode;
+    let confidence = scriptGuess.confidence;
+    if (resolvedCode === "en") {
+      try {
+        const gtx = await translateSingleTextFreeGtx({
+          text: sampleText.slice(0, 350),
+          sourceLanguage: "auto",
+          targetLanguage: "en",
+        });
+        if (gtx.detectedSource) {
+          resolvedCode = gtx.detectedSource;
+          confidence = 0.88;
+        }
+      } catch {
+        /* keep local script guess */
+      }
+    }
+
+    const meta = getLanguageMeta(resolvedCode);
+    return res.json({
+      languageCode: meta.code,
+      languageName: meta.name,
+      nativeName: meta.nativeName,
+      dir: meta.dir,
+      confidence,
+      provider: "free_detect",
+    });
   });
 
   app.post("/api/ai/translate", async (req: Request, res: Response) => {
     const auth = await verifyCallerAuth(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.message });
-    if (!checkRateLimit(auth.callerId)) {
+    if (!checkRateLimit(auth.callerId, auth.isGuest ? GUEST_RATE_LIMIT_MAX_REQ : RATE_LIMIT_MAX_REQ)) {
       return res.status(429).json({ error: "Too many translation requests. Please wait a moment.", code: "RATE_LIMITED" });
-    }
-
-    const ai = getGenAiClient();
-    if (!ai) {
-      return res.status(503).json({
-        error: "AI translation requires a GEMINI_API_KEY configured in Settings > Secrets.",
-        code: "AI_NOT_CONFIGURED",
-      });
     }
 
     const {
@@ -379,8 +551,9 @@ async function startServer() {
 
     const srcMeta = getLanguageMeta(sourceLanguage);
     const tgtMeta = getLanguageMeta(targetLanguage);
+    const ai = getGenAiClient();
     const useLiteraryModel = quality === "literary" && sanitizedBlocks.length > 1;
-    const selectedModel = useLiteraryModel ? TRANSLATION_MODEL : FAST_TRANSLATION_MODEL;
+    const selectedModel = ai ? (useLiteraryModel ? TRANSLATION_MODEL : FAST_TRANSLATION_MODEL) : "free_fallback";
     const cacheKey = sha256(
       JSON.stringify({
         m: selectedModel,
@@ -394,112 +567,146 @@ async function startServer() {
 
     const cached = translationCache.get(cacheKey);
     if (cached) {
-      return res.json({ ...cached, targetLanguage: tgtMeta.code, dir: tgtMeta.dir, cached: true });
+      return res.json({
+        ...cached,
+        targetLanguage: tgtMeta.code,
+        dir: tgtMeta.dir,
+        provider: ai ? "gemini" : "free_gtx",
+        cached: true,
+      });
     }
 
     let pending = inflightTranslations.get(cacheKey);
     if (!pending) {
       pending = (async () => {
-        const thinkingLevel = useLiteraryModel ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
+        if (ai && Date.now() >= geminiTranslateCooldownUntil) {
+          try {
+            const thinkingLevel = useLiteraryModel ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
 
-        const qualityInstruction =
-          quality === "literary"
-            ? "Prioritize literary flow, natural storytelling tone, idioms, cultural nuance, and dialogue voice in the target language while remaining faithful to the author's meaning."
-            : quality === "high"
-              ? "Prioritize natural grammar, context-aware phrasing, technical/historical accuracy, and consistent terminology."
-              : "Prioritize clear, accurate, concise translation preserving exact paragraph structure.";
+            const qualityInstruction =
+              quality === "literary"
+                ? "Prioritize literary flow, natural storytelling tone, idioms, cultural nuance, and dialogue voice in the target language while remaining faithful to the author's meaning."
+                : quality === "high"
+                  ? "Prioritize natural grammar, context-aware phrasing, technical/historical accuracy, and consistent terminology."
+                  : "Prioritize clear, accurate, concise translation preserving exact paragraph structure.";
 
-        const glossaryText =
-          Array.isArray(glossary) && glossary.length > 0
-            ? glossary
-                .slice(0, 30)
-                .map((g) => `- "${g.source}" -> "${g.target}"`)
-                .join("\n")
-            : "";
+            const glossaryText =
+              Array.isArray(glossary) && glossary.length > 0
+                ? glossary
+                    .slice(0, 30)
+                    .map((g) => `- "${g.source}" -> "${g.target}"`)
+                    .join("\n")
+                : "";
 
-        const contextText =
-          Array.isArray(previousContext) && previousContext.length > 0
-            ? previousContext.slice(-2).join("\n")
-            : "";
+            const contextText =
+              Array.isArray(previousContext) && previousContext.length > 0
+                ? previousContext.slice(-2).join("\n")
+                : "";
 
-        const systemInstruction = [
-          `You are a professional literary and technical book translator translating from ${srcMeta.name} (${srcMeta.code}) into ${tgtMeta.name} (${tgtMeta.nativeName}, ${tgtMeta.code}).`,
-          qualityInstruction,
-          "Strict rules:",
-          "1. Return a 1-to-1 translation for every item id provided, in exact order, without merging, splitting, skipping, or inventing sentences.",
-          "2. Keep character names consistent with the glossary; do not randomly localize established proper nouns unless standard.",
-          "3. Preserve numbers, dates, citations, footnote markers, and punctuation naturally in the target script.",
-          tgtMeta.dir === "rtl"
-            ? `4. Format all ${tgtMeta.name} prose cleanly for right-to-left (RTL) reading.`
-            : `4. Format all ${tgtMeta.name} prose cleanly for left-to-right (LTR) reading.`,
-        ].join("\n");
+            const systemInstruction = [
+              `You are a professional literary and technical book translator translating from ${srcMeta.name} (${srcMeta.code}) into ${tgtMeta.name} (${tgtMeta.nativeName}, ${tgtMeta.code}).`,
+              qualityInstruction,
+              "Strict rules:",
+              "1. Return a 1-to-1 translation for every item id provided, in exact order, without merging, splitting, skipping, or inventing sentences.",
+              "2. Keep character names consistent with the glossary; do not randomly localize established proper nouns unless standard.",
+              "3. Preserve numbers, dates, citations, footnote markers, and punctuation naturally in the target script.",
+              tgtMeta.dir === "rtl"
+                ? `4. Format all ${tgtMeta.name} prose cleanly for right-to-left (RTL) reading.`
+                : `4. Format all ${tgtMeta.name} prose cleanly for left-to-right (LTR) reading.`,
+            ].join("\n");
 
-        const userPrompt = [
-          bookTitle ? `Book title: ${bookTitle}` : "",
-          glossaryText ? `Approved Glossary:\n${glossaryText}` : "",
-          contextText ? `Preceding Context (reference only, do not include in output):\n${contextText}` : "",
-          `Segments to translate (JSON):\n${JSON.stringify(sanitizedBlocks)}`,
-        ]
-          .filter(Boolean)
-          .join("\n\n");
+            const userPrompt = [
+              bookTitle ? `Book title: ${bookTitle}` : "",
+              glossaryText ? `Approved Glossary:\n${glossaryText}` : "",
+              contextText ? `Preceding Context (reference only, do not include in output):\n${contextText}` : "",
+              `Segments to translate (JSON):\n${JSON.stringify(sanitizedBlocks)}`,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
 
-        const response = await withRetry(() =>
-          ai.models.generateContent({
-            model: selectedModel,
-            contents: userPrompt,
-            config: {
-              systemInstruction,
-              thinkingConfig: { thinkingLevel },
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  items: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        id: { type: Type.STRING },
-                        translatedText: { type: Type.STRING },
+            const response = await withRetry(() =>
+              ai.models.generateContent({
+                model: useLiteraryModel ? TRANSLATION_MODEL : FAST_TRANSLATION_MODEL,
+                contents: userPrompt,
+                config: {
+                  systemInstruction,
+                  thinkingConfig: { thinkingLevel },
+                  responseMimeType: "application/json",
+                  responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                      items: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            id: { type: Type.STRING },
+                            translatedText: { type: Type.STRING },
+                          },
+                          required: ["id", "translatedText"],
+                        },
                       },
-                      required: ["id", "translatedText"],
-                    },
-                  },
-                  glossaryAdditions: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        source: { type: Type.STRING },
-                        target: { type: Type.STRING },
+                      glossaryAdditions: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.OBJECT,
+                          properties: {
+                            source: { type: Type.STRING },
+                            target: { type: Type.STRING },
+                          },
+                          required: ["source", "target"],
+                        },
                       },
-                      required: ["source", "target"],
                     },
+                    required: ["items", "glossaryAdditions"],
                   },
                 },
-                required: ["items", "glossaryAdditions"],
-              },
-            },
-          }),
-        );
+              }),
+            );
 
-        const parsed = parseModelJson<{
-          items?: Array<{ id: string; translatedText: string }>;
-          glossaryAdditions?: Array<{ source: string; target: string }>;
-        }>(response.text || "{}");
+            const parsed = parseModelJson<{
+              items?: Array<{ id: string; translatedText: string }>;
+              glossaryAdditions?: Array<{ source: string; target: string }>;
+            }>(response.text || "{}");
 
-        const items = Array.isArray(parsed.items) ? parsed.items : [];
-        const check = validateTranslationBatch(
-          sanitizedBlocks.map((b) => ({ id: b.id, text: b.text })),
-          items,
-        );
-        if (!check.valid) {
-          throw new Error(check.error || "Incomplete translation batch returned.");
+            const items = Array.isArray(parsed.items) ? parsed.items : [];
+            const check = validateTranslationBatch(
+              sanitizedBlocks.map((b) => ({ id: b.id, text: b.text })),
+              items,
+            );
+            if (!check.valid) {
+              throw new Error(check.error || "Incomplete translation batch returned.");
+            }
+
+            const result = {
+              items: sanitizedBlocks.map((b) => ({ id: b.id, translatedText: check.map[b.id] })),
+              glossaryAdditions: Array.isArray(parsed.glossaryAdditions)
+                ? parsed.glossaryAdditions.slice(0, 12)
+                : [],
+            };
+            setBoundedCache(translationCache, cacheKey, result, MAX_TRANSLATION_CACHE);
+            return result;
+          } catch (geminiErr) {
+            const errStatus = Number((geminiErr as { status?: number })?.status || 0);
+            if (errStatus === 400 || errStatus === 401 || errStatus === 403 || errStatus === 404 || errStatus === 429) {
+              geminiTranslateCooldownUntil = Date.now() + 5 * 60_000;
+            }
+            console.warn(
+              "[Translate] Gemini failed, switching to free fallback:",
+              geminiErr instanceof Error ? geminiErr.message : geminiErr,
+            );
+          }
         }
 
+        // Tier 2 Free Multilingual Fallback (Google GTX -> MyMemory)
+        const freeResult = await translateBlocksFree({
+          blocks: sanitizedBlocks,
+          sourceLanguage: sourceLanguage === "auto" ? "auto" : srcMeta.code,
+          targetLanguage: tgtMeta.code,
+        });
         const result = {
-          items: sanitizedBlocks.map((b) => ({ id: b.id, translatedText: check.map[b.id] })),
-          glossaryAdditions: Array.isArray(parsed.glossaryAdditions) ? parsed.glossaryAdditions.slice(0, 12) : [],
+          items: freeResult.items,
+          glossaryAdditions: [],
         };
         setBoundedCache(translationCache, cacheKey, result, MAX_TRANSLATION_CACHE);
         return result;
@@ -510,7 +717,13 @@ async function startServer() {
 
     try {
       const result = await pending;
-      res.json({ ...result, targetLanguage: tgtMeta.code, dir: tgtMeta.dir, cached: false });
+      res.json({
+        ...result,
+        targetLanguage: tgtMeta.code,
+        dir: tgtMeta.dir,
+        provider: ai ? "gemini_or_free" : "free_gtx",
+        cached: false,
+      });
     } catch (err) {
       const mapped = mapAiError(err);
       res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
@@ -522,7 +735,7 @@ async function startServer() {
   app.post("/api/ai/tts", async (req: Request, res: Response) => {
     const auth = await verifyCallerAuth(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.message });
-    if (!checkRateLimit(auth.callerId)) {
+    if (!checkRateLimit(auth.callerId, auth.isGuest ? GUEST_RATE_LIMIT_MAX_REQ : RATE_LIMIT_MAX_REQ)) {
       return res.status(429).json({ error: "Too many audio generation requests. Please pause briefly.", code: "RATE_LIMITED" });
     }
 
@@ -531,6 +744,12 @@ async function startServer() {
       return res.status(503).json({
         error: "AI audiobook narration requires a GEMINI_API_KEY configured in Settings > Secrets.",
         code: "AI_NOT_CONFIGURED",
+      });
+    }
+    if (Date.now() < geminiTtsCooldownUntil) {
+      return res.status(429).json({
+        error: "Studio AI TTS is temporarily rate-limited; falling back to Device Voice.",
+        code: "RATE_LIMITED",
       });
     }
 
@@ -679,6 +898,9 @@ async function startServer() {
       res.send(wavBuffer);
     } catch (err) {
       const mapped = mapAiError(err);
+      if (mapped.status === 429 || mapped.status === 401 || mapped.status === 403 || mapped.status === 404) {
+        geminiTtsCooldownUntil = Date.now() + (mapped.status === 429 ? 60_000 : 5 * 60_000);
+      }
       res.status(mapped.status).json({ error: mapped.message, code: mapped.code });
     } finally {
       inflightTts.delete(cacheKey);
@@ -688,7 +910,7 @@ async function startServer() {
   app.post("/api/ai/tts/preview", async (req: Request, res: Response) => {
     const auth = await verifyCallerAuth(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.message });
-    if (!checkRateLimit(auth.callerId)) {
+    if (!checkRateLimit(auth.callerId, auth.isGuest ? GUEST_RATE_LIMIT_MAX_REQ : RATE_LIMIT_MAX_REQ)) {
       return res.status(429).json({ error: "Too many preview requests.", code: "RATE_LIMITED" });
     }
 
