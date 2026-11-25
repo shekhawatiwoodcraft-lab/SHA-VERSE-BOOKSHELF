@@ -53,6 +53,9 @@ const LibraryDashboard = lazy(() => import("./pages/LibraryDashboard"));
 const Settings = lazy(() => import("./pages/Settings"));
 const AdminPanel = lazy(() => import("./pages/AdminPanel"));
 const OfflinePage = lazy(() => import("./pages/Offline"));
+const PrivacyPolicy = lazy(() => import("./pages/PrivacyPolicy"));
+const TermsOfService = lazy(() => import("./pages/TermsOfService"));
+const DeleteAccount = lazy(() => import("./pages/DeleteAccount"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 
 const queryClient = new QueryClient({
@@ -124,6 +127,9 @@ const App = () => (
                     <Routes>
                       <Route path="/auth" element={withSuspense(Auth)} />
                       <Route path="/offline" element={withSuspense(OfflinePage)} />
+                      <Route path="/privacy" element={withSuspense(PrivacyPolicy)} />
+                      <Route path="/terms" element={withSuspense(TermsOfService)} />
+                      <Route path="/delete-account" element={withSuspense(DeleteAccount)} />
                       <Route
                         path="/"
                         element={<ProtectedRoute>{withSuspense(Bookshelf)}</ProtectedRoute>}

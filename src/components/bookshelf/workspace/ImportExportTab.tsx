@@ -8,6 +8,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { Download, Upload, Search, Loader2, CheckCircle2, AlertTriangle, BookPlus } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useQueryClient } from "@tanstack/react-query";
+import { buildAiApiUrl } from "@/lib/ai/apiBase";
 import {
   parseAndValidateBookImport,
   serializeBooksToCsv,
@@ -134,7 +135,12 @@ export function ImportExportTab({ books, userChannelId, userId }: ImportExportTa
     setIsbnLoading(true);
     setIsbnResult(null);
     try {
-      const resp = await fetch(`/api/v1/books/lookup-isbn/${encodeURIComponent(cleaned)}`);
+      const resp = await fetch(
+        buildAiApiUrl(
+          `/api/v1/books/lookup-isbn/${encodeURIComponent(cleaned)}`,
+          import.meta.env.VITE_API_BASE_URL,
+        ),
+      );
       const body = (await resp.json()) as IsbnLookupResult & { error?: string };
       if (!resp.ok) throw new Error(body.error || "Lookup failed");
       setIsbnResult(body);

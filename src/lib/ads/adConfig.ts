@@ -15,7 +15,7 @@
  * AdMob test device instead of flipping these flags.
  */
 
-export const USE_TEST_ADS = false;
+export const USE_TEST_ADS = true;
 
 /**
  * 🙈 GLOBAL ADS VISIBILITY SWITCH

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { supabase, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -917,6 +917,20 @@ const Auth = () => {
               </div>
             </>
           )}
+
+          <div className="mt-6 pt-4 border-t border-border/60 flex flex-wrap items-center justify-center gap-3 text-xs text-muted-foreground">
+            <Link to="/privacy" className="hover:text-foreground underline-offset-2 hover:underline">
+              Privacy Policy
+            </Link>
+            <span>&middot;</span>
+            <Link to="/terms" className="hover:text-foreground underline-offset-2 hover:underline">
+              Terms
+            </Link>
+            <span>&middot;</span>
+            <Link to="/delete-account" className="hover:text-foreground underline-offset-2 hover:underline">
+              Delete Account
+            </Link>
+          </div>
         </Card>
       </div>
     </>

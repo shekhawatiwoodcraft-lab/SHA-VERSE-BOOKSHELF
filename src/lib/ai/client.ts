@@ -1,10 +1,15 @@
 import { getAuthTokenForAi, refreshAuthTokenForAi } from "@/lib/ai/cache";
+import { buildAiApiUrl } from "@/lib/ai/apiBase";
 import type {
   GeminiPrebuiltVoiceId,
   NarrationStyleId,
   TranslationQuality,
   VoiceProfile,
 } from "@/lib/ai/languages";
+
+function aiApiUrl(path: string): string {
+  return buildAiApiUrl(path, import.meta.env.VITE_API_BASE_URL);
+}
 
 export class AiServiceError extends Error {
   status: number;
@@ -95,13 +100,13 @@ async function parseErrorResponse(res: Response): Promise<AiServiceError> {
 }
 
 export async function fetchAiHealth(signal?: AbortSignal): Promise<AiHealthStatus> {
-  const res = await fetch("/api/ai/health", { signal });
+  const res = await fetch(aiApiUrl("/api/ai/health"), { signal });
   if (!res.ok) throw await parseErrorResponse(res);
   return (await res.json()) as AiHealthStatus;
 }
 
 export async function fetchAiVoices(signal?: AbortSignal): Promise<{ voices: VoiceProfile[] }> {
-  const res = await fetch("/api/ai/voices", { signal });
+  const res = await fetch(aiApiUrl("/api/ai/voices"), { signal });
   if (!res.ok) throw await parseErrorResponse(res);
   return (await res.json()) as { voices: VoiceProfile[] };
 }
@@ -110,7 +115,7 @@ export async function detectBookLanguage(
   sampleText: string,
   signal?: AbortSignal,
 ): Promise<LanguageDetectionResult> {
-  const res = await fetchWithAuthRetry("/api/ai/detect-language", {
+  const res = await fetchWithAuthRetry(aiApiUrl("/api/ai/detect-language"), {
     method: "POST",
     extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({ sampleText }),
@@ -130,7 +135,7 @@ export async function translateBookBatch(params: {
   glossary?: Array<{ source: string; target: string }>;
   signal?: AbortSignal;
 }): Promise<TranslationBatchResponse> {
-  const res = await fetchWithAuthRetry("/api/ai/translate", {
+  const res = await fetchWithAuthRetry(aiApiUrl("/api/ai/translate"), {
     method: "POST",
     extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -188,7 +193,7 @@ export async function generateSpeechWav(params: {
   dialogueMode?: boolean;
   signal?: AbortSignal;
 }): Promise<Blob> {
-  const res = await fetchWithAuthRetry("/api/ai/tts", {
+  const res = await fetchWithAuthRetry(aiApiUrl("/api/ai/tts"), {
     method: "POST",
     extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -213,7 +218,7 @@ export async function generateVoicePreviewWav(params: {
   sampleText?: string;
   signal?: AbortSignal;
 }): Promise<Blob> {
-  const res = await fetchWithAuthRetry("/api/ai/tts/preview", {
+  const res = await fetchWithAuthRetry(aiApiUrl("/api/ai/tts/preview"), {
     method: "POST",
     extraHeaders: { "Content-Type": "application/json" },
     body: JSON.stringify({
