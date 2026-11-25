@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { compressImage } from "@/lib/media/compressImage";
+import { resolveSafeImageUploadMeta } from "@/lib/media/uploadMeta";
 import { useAuth } from "@/contexts/AuthContext";
 import { useUpdateChannel } from "@/hooks/useChannels";
 import { Button } from "@/components/ui/button";
@@ -86,13 +87,17 @@ const EditAuthorChannel = () => {
         }
     };
 
-    const uploadFile = async (rawFile: File, bucket: string) => {
+    const uploadFile = async (rawFile: File, bucket: string, prefix: "avatar" | "banner") => {
         const file = await compressImage(rawFile);
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${user?.id}/${Date.now()}.${fileExt}`;
+        const { ext, contentType } = resolveSafeImageUploadMeta(file);
+        const fileName = `${user?.id}/${prefix}_${Date.now()}.${ext}`;
         const { error: uploadError } = await supabase.storage
             .from(bucket)
-            .upload(fileName, file);
+            .upload(fileName, file, {
+                contentType,
+                cacheControl: "3600",
+                upsert: true,
+            });
 
         if (uploadError) throw uploadError;
 
@@ -111,12 +116,12 @@ const EditAuthorChannel = () => {
 
             // Upload Avatar if changed
             if (avatarFile) {
-                newAvatarUrl = await uploadFile(avatarFile, "avatars");
+                newAvatarUrl = await uploadFile(avatarFile, "avatars", "avatar");
             }
 
             // Upload Banner if changed
             if (bannerFile) {
-                newBannerUrl = await uploadFile(bannerFile, "avatars"); // Using avatars bucket for both for now, or use a general 'images' bucket
+                newBannerUrl = await uploadFile(bannerFile, "avatars", "banner");
             }
 
             await updateChannel.mutateAsync({
@@ -127,9 +132,7 @@ const EditAuthorChannel = () => {
                 bannerUrl: newBannerUrl,
             });
 
-            toast.success("Channel updated successfully!");
-            // Navigate back after short delay
-            setTimeout(() => navigate(`/bookshelf/channel/${channelId}`), 500);
+            navigate(`/bookshelf/channel/${channelId}`, { replace: true });
 
         } catch (error: any) {
             toast.error("Failed to update channel: " + error.message);

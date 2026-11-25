@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogHeader,
   DialogTitle,
@@ -636,55 +637,86 @@ const UploadBookDialog = ({
 
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? onOpenChange(true) : handleClose())}>
-      <DialogContent className="!fixed !inset-0 !left-0 !top-0 !translate-x-0 !translate-y-0 !w-full !h-full !max-w-none !max-h-none !rounded-none !border-0 !p-0 flex flex-col gap-0 overflow-hidden bg-background">
-        {/* Sticky Full-Screen Header */}
-        <DialogHeader className="px-4 sm:px-8 py-3.5 pr-14 border-b bg-background/95 backdrop-blur shrink-0 text-left">
+      <DialogContent className="!fixed !inset-0 !left-0 !top-0 !translate-x-0 !translate-y-0 !w-full !h-[100dvh] !max-w-none !max-h-none !rounded-none !border-0 !p-0 flex flex-col gap-0 overflow-hidden bg-background [&>button.absolute]:hidden">
+        {/* Sticky Full-Screen Header (clears Android/iOS status bar via safe-area-inset-top) */}
+        <DialogHeader
+          className="px-4 sm:px-8 pb-3.5 border-b bg-background/95 backdrop-blur shrink-0 text-left"
+          style={{ paddingTop: "calc(0.875rem + env(safe-area-inset-top, 0px))" }}
+        >
           <div className="max-w-5xl mx-auto w-full flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <DialogTitle className="text-lg sm:text-xl font-bold">
-              {isAppOwner ? "Upload Books" : "Upload Book"}
-            </DialogTitle>
+            <div className="flex items-center justify-between gap-3 w-full sm:w-auto">
+              <DialogTitle className="text-lg sm:text-xl font-bold">
+                {isAppOwner ? "Upload Books" : "Upload Book"}
+              </DialogTitle>
+              <DialogClose asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  disabled={isBusy}
+                  aria-label="Close"
+                  className="sm:hidden h-9 w-9 shrink-0 rounded-full"
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </DialogClose>
+            </div>
 
-            {/* Single vs Bulk Segmented Toggle — App Owner Only */}
-            {isAppOwner && (
-              <div
-                role="tablist"
-                aria-label="Upload mode"
-                className="inline-flex rounded-lg border bg-muted/50 p-1 self-start sm:self-auto"
-              >
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={mode === "single"}
-                  disabled={isBusy}
-                  onClick={() => setRequestedMode("single")}
-                  className={cn(
-                    "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
-                    mode === "single"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  )}
+            <div className="flex items-center gap-3 self-start sm:self-auto">
+              {/* Single vs Bulk Segmented Toggle — App Owner Only */}
+              {isAppOwner && (
+                <div
+                  role="tablist"
+                  aria-label="Upload mode"
+                  className="inline-flex rounded-lg border bg-muted/50 p-1"
                 >
-                  <FileText className="w-3.5 h-3.5" />
-                  Single (1 Book)
-                </button>
-                <button
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === "single"}
+                    disabled={isBusy}
+                    onClick={() => setRequestedMode("single")}
+                    className={cn(
+                      "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
+                      mode === "single"
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    Single (1 Book)
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === "bulk"}
+                    disabled={isBusy}
+                    onClick={() => setRequestedMode("bulk")}
+                    className={cn(
+                      "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
+                      mode === "bulk"
+                        ? "bg-background text-foreground shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    Bulk (Max {MAX_BULK_BOOKS})
+                  </button>
+                </div>
+              )}
+              <DialogClose asChild>
+                <Button
                   type="button"
-                  role="tab"
-                  aria-selected={mode === "bulk"}
+                  variant="ghost"
+                  size="icon"
                   disabled={isBusy}
-                  onClick={() => setRequestedMode("bulk")}
-                  className={cn(
-                    "px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-1.5",
-                    mode === "bulk"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  )}
+                  aria-label="Close"
+                  className="hidden sm:inline-flex h-9 w-9 shrink-0 rounded-full"
                 >
-                  <Layers className="w-3.5 h-3.5" />
-                  Bulk (Max {MAX_BULK_BOOKS})
-                </button>
-              </div>
-            )}
+                  <X className="h-4 w-4" />
+                </Button>
+              </DialogClose>
+            </div>
           </div>
         </DialogHeader>
 
@@ -1165,8 +1197,8 @@ const UploadBookDialog = ({
 
         {/* Sticky Bottom Footer */}
         <div
-          className="px-4 sm:px-8 py-4 border-t bg-background/95 backdrop-blur shrink-0"
-          style={{ paddingBottom: "max(1rem, env(safe-area-inset-bottom, 1rem))" }}
+          className="px-4 sm:px-8 pt-3.5 border-t bg-background/95 backdrop-blur shrink-0"
+          style={{ paddingBottom: "calc(1rem + env(safe-area-inset-bottom, 0px))" }}
         >
           <div className="max-w-5xl mx-auto w-full flex items-center justify-end gap-3">
             <Button

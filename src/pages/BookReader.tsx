@@ -18,7 +18,9 @@ import {
   READER_THEMES,
   useReaderSettings,
 } from "@/lib/reader/settings";
-import { loadAnchor, saveAnchor } from "@/lib/reader/cache";
+import { loadAnchor, saveAnchor, type ReadingAnchor } from "@/lib/reader/cache";
+import { getDefaultPdfFitMode } from "@/lib/reader/pdfLayout";
+import { hasPaginationChanged } from "@/lib/reader/scrollPerf";
 import {
   ArrowLeft, ChevronLeft, ChevronRight, Bookmark, BookmarkCheck, Settings,
   ZoomIn, ZoomOut, Book, List, X, FileText,
@@ -37,6 +39,11 @@ import {
   type TranslationQuality,
   type TranslationReadingMode,
 } from "@/lib/ai/languages";
+import {
+  READER_AUDIO_TRANSLATION_HIDDEN,
+  getVisibleReaderSettingsTabs,
+  resolveActiveSettingsTab,
+} from "@/lib/ai/featureFlags";
 import {
   chunkBlocksByBudget,
   extractCandidateGlossaryTerms,
@@ -118,7 +125,9 @@ const BookReader = () => {
   const [activeEpubHref, setActiveEpubHref] = useState<string>("");
   // Zoom factor where 1.0 = fit page/width; up to 3.0 = 300%.
   const [scale, setScale] = useState(1);
-  const [pdfFitMode, setPdfFitMode] = useState<"page" | "width">("page");
+  const [pdfFitMode, setPdfFitMode] = useState<"page" | "width">(() =>
+    typeof window !== "undefined" ? getDefaultPdfFitMode(window.innerWidth) : "page"
+  );
   const [epubCfi, setEpubCfi] = useState<string | undefined>();
   const [reflowNoticeDismissed, setReflowNoticeDismissed] = useState(false);
   const [noteDraft, setNoteDraft] = useState<{ highlightId: string; text: string; value: string } | null>(null);
@@ -172,6 +181,9 @@ const BookReader = () => {
     percent: 0,
     chapterTitle: "",
   });
+  const handleReaderPaginationChange = useCallback((next: PaginationInfo) => {
+    setReaderPagination((prev) => (hasPaginationChanged(prev, next) ? next : prev));
+  }, []);
   const [navRequest, setNavRequest] = useState<{ delta: number; token: number } | null>(null);
   const navTokenRef = useRef(0);
   const requestFlip = useCallback((delta: number) => {
@@ -347,6 +359,23 @@ const BookReader = () => {
     });
   }, [isReaderMode, bookId, reflow.book, pageStartIndex, jumpToBlock]);
 
+  const pendingAnchorRef = useRef<{ bookId: string; anchor: ReadingAnchor } | null>(null);
+  const saveAnchorTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (saveAnchorTimerRef.current) {
+        window.clearTimeout(saveAnchorTimerRef.current);
+        saveAnchorTimerRef.current = null;
+      }
+      const pending = pendingAnchorRef.current;
+      if (pending) {
+        pendingAnchorRef.current = null;
+        void saveAnchor(pending.bookId, pending.anchor);
+      }
+    };
+  }, [bookId]);
+
   const handleReaderLocation = useCallback(
     (location: { blockIndex: number; blockId: string; page: number; percent: number; snippet: string }) => {
       currentLocationBlockRef.current = {
@@ -355,14 +384,28 @@ const BookReader = () => {
       };
       setCurrentPage((prev) => (prev === location.page ? prev : location.page));
       if (bookId) {
-        void saveAnchor(bookId, {
-          blockId: location.blockId,
-          blockIndex: location.blockIndex,
-          charOffset: 0,
-          snippet: location.snippet,
-          page: location.page,
-          updatedAt: Date.now(),
-        });
+        pendingAnchorRef.current = {
+          bookId,
+          anchor: {
+            blockId: location.blockId,
+            blockIndex: location.blockIndex,
+            charOffset: 0,
+            snippet: location.snippet,
+            page: location.page,
+            updatedAt: Date.now(),
+          },
+        };
+        if (saveAnchorTimerRef.current) {
+          window.clearTimeout(saveAnchorTimerRef.current);
+        }
+        saveAnchorTimerRef.current = window.setTimeout(() => {
+          saveAnchorTimerRef.current = null;
+          const pending = pendingAnchorRef.current;
+          if (pending) {
+            pendingAnchorRef.current = null;
+            void saveAnchor(pending.bookId, pending.anchor);
+          }
+        }, 600);
       }
     },
     [bookId]
@@ -1077,7 +1120,7 @@ const BookReader = () => {
     setShowToc(false);
     setShowBookmarks(false);
     setShowSearch(false);
-    if (fileType === "pdf" && !aiExtractionRequested) {
+    if (!READER_AUDIO_TRANSLATION_HIDDEN && fileType === "pdf" && !aiExtractionRequested) {
       setAiExtractionRequested(true);
     }
 
@@ -1138,7 +1181,7 @@ const BookReader = () => {
   prepareAudioTabStateRef.current = prepareAudioTabState;
 
   useEffect(() => {
-    if (!showSettingsSheet) return;
+    if (!showSettingsSheet || READER_AUDIO_TRANSLATION_HIDDEN) return;
     if (settingsTab === "translation") void ensureStructuredBookRef.current();
     else if (settingsTab === "audio") void prepareAudioTabStateRef.current();
   }, [showSettingsSheet, settingsTab, bookId]);
@@ -2278,6 +2321,11 @@ const BookReader = () => {
   const displayTotal = isReaderMode ? readerPagination.totalPages : totalPages;
   const displayPercent = isReaderMode ? readerPagination.percent : progressPercent;
   const isCurrentPageBookmarked = isPageBookmarked(currentPage);
+  const visibleSettingsTabs = getVisibleReaderSettingsTabs();
+  const activeSettingsTab = resolveActiveSettingsTab(settingsTab);
+  const effectiveTranslationReadingMode: TranslationReadingMode = READER_AUDIO_TRANSLATION_HIDDEN
+    ? "original"
+    : translationReadingMode;
   const showNativeReaderAd = nativeReaderAdsEnabled && nativeAdPage === displayPage;
 
   return (
@@ -2490,40 +2538,36 @@ const BookReader = () => {
             </div>
 
             {/* Text-only settings tabs (zero icons) */}
-            <div className="mx-auto max-w-5xl px-3 sm:px-6 pb-3">
-              <div
-                role="tablist"
-                aria-label="Reader settings sections"
-                className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1 max-w-xl mx-auto"
-              >
-                {(
-                  [
-                    { id: "appearance", label: "Appearance" },
-                    { id: "translation", label: "Translation" },
-                    { id: "audio", label: "Audio Reader" },
-                  ] as const
-                ).map((tab) => {
-                  const active = settingsTab === tab.id;
-                  return (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={active}
-                      onClick={() => handleSelectSettingsTab(tab.id)}
-                      className={cn(
-                        "rounded-md px-3 py-2 text-xs sm:text-sm font-medium transition-colors text-center",
-                        active
-                          ? "bg-background text-foreground shadow-sm font-semibold"
-                          : "text-muted-foreground hover:text-foreground",
-                      )}
-                    >
-                      {tab.label}
-                    </button>
-                  );
-                })}
+            {visibleSettingsTabs.length > 1 && (
+              <div className="mx-auto max-w-5xl px-3 sm:px-6 pb-3">
+                <div
+                  role="tablist"
+                  aria-label="Reader settings sections"
+                  className="grid grid-cols-3 gap-1 rounded-lg bg-muted p-1 max-w-xl mx-auto"
+                >
+                  {visibleSettingsTabs.map((tab) => {
+                    const active = activeSettingsTab === tab.id;
+                    return (
+                      <button
+                        key={tab.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={active}
+                        onClick={() => handleSelectSettingsTab(tab.id)}
+                        className={cn(
+                          "rounded-md px-3 py-2 text-xs sm:text-sm font-medium transition-colors text-center",
+                          active
+                            ? "bg-background text-foreground shadow-sm font-semibold"
+                            : "text-muted-foreground hover:text-foreground",
+                        )}
+                      >
+                        {tab.label}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           {/* Scrollable Responsive Settings Workspace */}
@@ -2532,7 +2576,7 @@ const BookReader = () => {
             style={{ paddingBottom: "max(28px, env(safe-area-inset-bottom, 0px))" }}
           >
             <div className="mx-auto w-full max-w-5xl px-4 sm:px-6 py-5 sm:py-6">
-              {settingsTab === "appearance" && (
+              {activeSettingsTab === "appearance" && (
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                   <div className="lg:col-span-7 rounded-xl border border-border/70 bg-card px-4 sm:px-5">
                     <ReaderSettingsPanel
@@ -2660,31 +2704,33 @@ const BookReader = () => {
                             )}
                           </div>
 
-                          <div>
-                            <p className="text-xs font-medium uppercase tracking-wider opacity-70 mb-2">
-                              More tools
-                            </p>
-                            <div className="grid grid-cols-2 gap-2">
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => handleSelectSettingsTab("translation")}
-                                className="h-9 text-xs font-medium"
-                              >
-                                Translation
-                              </Button>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => handleSelectSettingsTab("audio")}
-                                className="h-9 text-xs font-medium"
-                              >
-                                Audio Reader
-                              </Button>
+                          {!READER_AUDIO_TRANSLATION_HIDDEN && (
+                            <div>
+                              <p className="text-xs font-medium uppercase tracking-wider opacity-70 mb-2">
+                                More tools
+                              </p>
+                              <div className="grid grid-cols-2 gap-2">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => handleSelectSettingsTab("translation")}
+                                  className="h-9 text-xs font-medium"
+                                >
+                                  Translation
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => handleSelectSettingsTab("audio")}
+                                  className="h-9 text-xs font-medium"
+                                >
+                                  Audio Reader
+                                </Button>
+                              </div>
                             </div>
-                          </div>
+                          )}
                         </div>
                       </>
                     )}
@@ -2692,7 +2738,7 @@ const BookReader = () => {
                 </div>
               )}
 
-              {settingsTab === "translation" && (
+              {!READER_AUDIO_TRANSLATION_HIDDEN && activeSettingsTab === "translation" && (
                 <div className="mx-auto max-w-2xl">
                   {fileType === "pdf" || fileType === "epub" ? (
                     <>
@@ -2761,7 +2807,7 @@ const BookReader = () => {
                 </div>
               )}
 
-              {settingsTab === "audio" && (
+              {!READER_AUDIO_TRANSLATION_HIDDEN && activeSettingsTab === "audio" && (
                 <div className="mx-auto max-w-2xl">
                   <AudioSettingsPanel
                     bookId={book.id}
@@ -3049,24 +3095,28 @@ const BookReader = () => {
       )}
 
 
-      {/* Main Content — true edge-to-edge. Always fills 100vh minus
-          (header when shown) and (footer when shown). Ads NEVER displace it. */}
+      {/* Main Content — true edge-to-edge. Clears fixed header + status bar inset
+          when controls are shown, and clears footer / native ad + nav inset. */}
       <main
-        className={cn(
-          "absolute inset-x-0 overflow-hidden transition-[top,bottom] duration-300",
-          showControls ? "top-14" : "top-0",
-          showControls
+        className="absolute inset-x-0 overflow-hidden transition-[top,bottom] duration-300"
+        style={{
+          top: showControls ? "calc(3.85rem + env(safe-area-inset-top, 0px))" : "0px",
+          bottom: showControls
             ? showNativeReaderAd
-              ? "bottom-[15rem] sm:bottom-[14rem]"
-              : "bottom-24 sm:bottom-20"
+              ? isMobile
+                ? "calc(14.75rem + env(safe-area-inset-bottom, 0px))"
+                : "calc(13.75rem + env(safe-area-inset-bottom, 0px))"
+              : isMobile
+                ? "calc(6rem + env(safe-area-inset-bottom, 0px))"
+                : "calc(5rem + env(safe-area-inset-bottom, 0px))"
             : showNativeReaderAd
-              ? "bottom-[10rem]"
-              : "bottom-0"
-        )}
+              ? "calc(9.5rem + env(safe-area-inset-bottom, 0px))"
+              : "0px",
+        }}
       >
         <div className="relative w-full h-full overflow-hidden flex flex-col" style={{ backgroundColor: activeThemePalette.bg }}>
           {/* Reader Mode — reflowable text extracted from the PDF, plus Translated / Bilingual modes. */}
-          {((isReaderMode || translationReadingMode !== "original") && book.book_url) && (
+          {((isReaderMode || effectiveTranslationReadingMode !== "original") && book.book_url) && (
             <>
               {!reflowNoticeDismissed && showControls && activeReflowBook && activeReflowBook.blocks.length > 0 && (
                 <div className="shrink-0 flex justify-center pt-1.5 pb-1 px-3 z-20" onClick={(e) => e.stopPropagation()}>
@@ -3079,7 +3129,7 @@ const BookReader = () => {
                     }}
                   >
                     <span className="truncate opacity-80">
-                      {translationReadingMode !== "original"
+                      {effectiveTranslationReadingMode !== "original"
                         ? `Translation Active · ${getLanguageMeta(targetLanguage).name}`
                         : activeReflowBook.meta.ocrPages || activeReflowBook.meta.rasterizedPages
                           ? `Adaptive Flow · ${
@@ -3097,7 +3147,7 @@ const BookReader = () => {
                             }`
                           : "Adaptive Flow · Layouts may vary"}
                     </span>
-                    {translationReadingMode !== "original" ? (
+                    {effectiveTranslationReadingMode !== "original" ? (
                       <button
                         type="button"
                         className="font-semibold underline shrink-0"
@@ -3130,8 +3180,8 @@ const BookReader = () => {
               )}
 
               <div className="relative flex-1 min-h-0 w-full">
-                {(translationReadingMode === "side_by_side" ||
-                  translationReadingMode === "paragraph_by_paragraph") &&
+                {(effectiveTranslationReadingMode === "side_by_side" ||
+                  effectiveTranslationReadingMode === "paragraph_by_paragraph") &&
                 activeReflowBook &&
                 activeReflowBook.blocks.length > 0 ? (
                   <BilingualReaderView
@@ -3140,7 +3190,7 @@ const BookReader = () => {
                     translatedMap={translatedMap}
                     sourceLanguage={sourceLanguage}
                     targetLanguage={targetLanguage}
-                    mode={translationReadingMode}
+                    mode={effectiveTranslationReadingMode}
                     settings={readerSettings}
                     activeSpeech={
                       audiobook.session?.bookId === book.id && audiobook.activeSegment
@@ -3169,7 +3219,7 @@ const BookReader = () => {
                     }}
                     onTap={toggleControls}
                   />
-                ) : (isReaderMode || translationReadingMode === "translated") &&
+                ) : (isReaderMode || effectiveTranslationReadingMode === "translated") &&
                   translatedReflowBook &&
                   translatedReflowBook.blocks.length > 0 ? (
                   <PaginatedReader
@@ -3180,7 +3230,9 @@ const BookReader = () => {
                     jumpTo={jumpTo}
                     navRequest={navRequest}
                     activeSpeech={
-                      audiobook.session?.bookId === book.id && audiobook.activeSegment
+                      !READER_AUDIO_TRANSLATION_HIDDEN &&
+                      audiobook.session?.bookId === book.id &&
+                      audiobook.activeSegment
                         ? {
                             blockId: audiobook.activeSegment.blockId,
                             sentenceIndex: audiobook.activeSegment.sentenceIndex,
@@ -3189,25 +3241,53 @@ const BookReader = () => {
                             status: audiobook.status === "idle" ? undefined : audiobook.status,
                             isTranslatedSpeech:
                               audiobook.activeSegment.language !== sourceLanguage &&
-                              translationReadingMode === "original",
+                              effectiveTranslationReadingMode === "original",
                           }
                         : null
                     }
-                    onSentenceClick={(bId, sIdx) => void handleSentencePlayRequest(bId, sIdx)}
-                    onParagraphAudioClick={(bId) => void handleParagraphAudio(bId)}
-                    onParagraphTranslateClick={(bId) => void handleParagraphTranslate(bId)}
+                    onSentenceClick={
+                      READER_AUDIO_TRANSLATION_HIDDEN
+                        ? undefined
+                        : (bId, sIdx) => void handleSentencePlayRequest(bId, sIdx)
+                    }
+                    onParagraphAudioClick={
+                      READER_AUDIO_TRANSLATION_HIDDEN
+                        ? undefined
+                        : (bId) => void handleParagraphAudio(bId)
+                    }
+                    onParagraphTranslateClick={
+                      READER_AUDIO_TRANSLATION_HIDDEN
+                        ? undefined
+                        : (bId) => void handleParagraphTranslate(bId)
+                    }
                     onCloseInlineTranslation={handleCloseInlineTranslation}
                     onSelectionChangeText={setSelectedBookText}
-                    onSelectionAudio={(text, isTr, langOv) => void handleSelectionAudio(text, isTr, langOv)}
-                    onSelectionTranslate={handleSelectionTranslate}
-                    inlineTranslations={
-                      translationReadingMode === "translated" ? originalBlockTextMap : translatedMap
+                    onSelectionAudio={
+                      READER_AUDIO_TRANSLATION_HIDDEN
+                        ? undefined
+                        : (text, isTr, langOv) => void handleSelectionAudio(text, isTr, langOv)
                     }
-                    inlineTranslationVisible={inlineTranslationVisible}
-                    inlineTranslatingIds={inlineTranslatingIds}
-                    inlineTranslateErrors={inlineTranslateErrors}
+                    onSelectionTranslate={
+                      READER_AUDIO_TRANSLATION_HIDDEN ? undefined : handleSelectionTranslate
+                    }
+                    inlineTranslations={
+                      READER_AUDIO_TRANSLATION_HIDDEN
+                        ? undefined
+                        : effectiveTranslationReadingMode === "translated"
+                          ? originalBlockTextMap
+                          : translatedMap
+                    }
+                    inlineTranslationVisible={
+                      READER_AUDIO_TRANSLATION_HIDDEN ? undefined : inlineTranslationVisible
+                    }
+                    inlineTranslatingIds={
+                      READER_AUDIO_TRANSLATION_HIDDEN ? undefined : inlineTranslatingIds
+                    }
+                    inlineTranslateErrors={
+                      READER_AUDIO_TRANSLATION_HIDDEN ? undefined : inlineTranslateErrors
+                    }
                     inlineTranslationMeta={
-                      translationReadingMode === "translated"
+                      effectiveTranslationReadingMode === "translated"
                         ? {
                             languageName: getLanguageMeta(sourceLanguage).name,
                             nativeName: "Original",
@@ -3223,7 +3303,7 @@ const BookReader = () => {
                     title={book.title}
                     author={book.author ?? undefined}
                     onLocationChange={handleReaderLocation}
-                    onPaginationChange={setReaderPagination}
+                    onPaginationChange={handleReaderPaginationChange}
                     onCreateHighlight={handleCreateHighlight}
                     onTap={toggleControls}
                   />
@@ -3259,14 +3339,12 @@ const BookReader = () => {
             </>
           )}
 
-          {/* Original PDF Viewer — wrapper paints theme bg behind canvas */}
-          {fileType === "pdf" && !isReaderMode && translationReadingMode === "original" && book.book_url && (
+          {/* Original PDF Viewer — single scrollport owned by PDFViewer */}
+          {fileType === "pdf" && !isReaderMode && effectiveTranslationReadingMode === "original" && book.book_url && (
             <div
-              className="w-full h-full overflow-auto overscroll-contain"
+              className="w-full h-full overflow-hidden"
               style={{
                 backgroundColor: activeThemePalette.bg,
-                WebkitOverflowScrolling: "touch",
-                touchAction: "pan-y pinch-zoom",
               }}
             >
               <PDFViewer
@@ -3284,13 +3362,13 @@ const BookReader = () => {
                 warmth={readerSettings.warmth}
                 isDarkMode={isDarkReaderTheme(readerSettings.theme)}
                 scale={scale}
-                className="max-w-full"
+                className="w-full h-full"
               />
             </div>
           )}
 
           {/* EPUB Viewer (original EPUB mode) */}
-          {fileType === "epub" && translationReadingMode === "original" && book.book_url && (
+          {fileType === "epub" && effectiveTranslationReadingMode === "original" && book.book_url && (
             <div
               ref={epubRef}
               className="w-full h-full block [&>div]:!h-full [&>div]:!min-h-[unset] [&_iframe]:!h-full"
@@ -3301,8 +3379,14 @@ const BookReader = () => {
                 initialCfi={epubCfi}
                 onLocationChange={handleEpubLocationChange}
                 onTocExtracted={handleEpubTocExtracted}
-                onParagraphAudio={(text) => void handleEpubParagraphAudio(text)}
-                onParagraphTranslate={handleEpubParagraphTranslate}
+                onParagraphAudio={
+                  READER_AUDIO_TRANSLATION_HIDDEN
+                    ? undefined
+                    : (text) => void handleEpubParagraphAudio(text)
+                }
+                onParagraphTranslate={
+                  READER_AUDIO_TRANSLATION_HIDDEN ? undefined : handleEpubParagraphTranslate
+                }
                 onTap={toggleControls}
                 settings={readerSettings}
                 className="!h-full !min-h-0 w-full"
@@ -3414,7 +3498,7 @@ const BookReader = () => {
           )}
 
           {/* Edge tap zones for mobile/tablet on Original EPUB (center stays clear for paragraph buttons & text) */}
-          {fileType === "epub" && translationReadingMode === "original" && (
+          {fileType === "epub" && effectiveTranslationReadingMode === "original" && (
             <div className="absolute inset-0 z-30 md:hidden flex justify-between pointer-events-none">
               <button
                 type="button"
@@ -3480,26 +3564,30 @@ const BookReader = () => {
       )}
 
       {/* Integrated Audiobook Dock */}
-      <AudiobookPlayer
-        chromeBg={activeThemePalette.chromeBg}
-        textColor={activeThemePalette.text}
-        borderColor={activeThemePalette.border}
-        isMobile={isMobile}
-        onSyncTextToAudio={() => {
-          const seg = audiobook.activeSegment;
-          if (!seg) return;
-          if (seg.language === targetLanguage && translationReadingMode === "original") {
-            setTranslationReadingMode("translated");
-          }
-          jumpToBlock(seg.blockIndex);
-        }}
-      />
+      {!READER_AUDIO_TRANSLATION_HIDDEN && (
+        <AudiobookPlayer
+          chromeBg={activeThemePalette.chromeBg}
+          textColor={activeThemePalette.text}
+          borderColor={activeThemePalette.border}
+          isMobile={isMobile}
+          onSyncTextToAudio={() => {
+            const seg = audiobook.activeSegment;
+            if (!seg) return;
+            if (seg.language === targetLanguage && translationReadingMode === "original") {
+              setTranslationReadingMode("translated");
+            }
+            jumpToBlock(seg.blockIndex);
+          }}
+        />
+      )}
 
       {/* Bottom Navigation */}
       <footer
         className={cn(
           "fixed bottom-0 left-0 right-0 z-50 transition-transform duration-300 backdrop-blur-sm border-t",
-          showControls && !(audiobook.session?.bookId === book.id && audiobook.isDrawerOpen && !audiobook.isMinimized)
+          showControls &&
+            (READER_AUDIO_TRANSLATION_HIDDEN ||
+              !(audiobook.session?.bookId === book.id && audiobook.isDrawerOpen && !audiobook.isMinimized))
             ? "translate-y-0"
             : "translate-y-full"
         )}

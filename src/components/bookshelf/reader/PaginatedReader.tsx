@@ -32,6 +32,11 @@ import {
 
 
 import { splitIntoSentences } from "@/lib/ai/segments";
+import {
+  findFirstVisibleBlockIndex,
+  hasPaginationChanged,
+  type PaginationSnapshot,
+} from "@/lib/reader/scrollPerf";
 
 export interface ReaderLocation {
   blockIndex: number;
@@ -619,12 +624,9 @@ const BlockView = memo(
             fontStyle: block.quote ? "italic" : undefined,
             color: block.small ? theme.muted : undefined,
             overflowWrap: "break-word",
-            textWrap: settings.justify ? undefined : "pretty",
             orphans: 2,
             widows: 2,
             fontKerning: "normal",
-            fontVariantLigatures: "common-ligatures",
-            textRendering: "optimizeLegibility",
             WebkitFontSmoothing: "antialiased",
           } as React.CSSProperties}
         >
@@ -832,6 +834,7 @@ const BlockSlot = memo(
         style={{
           contentVisibility: "auto",
           containIntrinsicSize: `auto ${Math.round(settings.fontSize * 4)}px`,
+          contain: "layout style",
         } as React.CSSProperties}
       >
         {body}
@@ -991,12 +994,24 @@ const PaginatedReader = ({
   /** Topmost visible block + how far into it we are — the reflow anchor. */
   const anchorRef = useRef<{ id: string; offset: number } | null>(null);
   const restoringRef = useRef(false);
+  /** Cached ordered block elements so scroll handlers never re-query the DOM. */
+  const blockNodesRef = useRef<HTMLElement[]>([]);
+
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    blockNodesRef.current = content
+      ? Array.from(content.querySelectorAll<HTMLElement>("[data-block-id]"))
+      : [];
+  }, [blocks, paged]);
 
   const visibleBlockElement = useCallback(() => {
     const scroller = scrollRef.current;
     const content = contentRef.current;
     if (!scroller || !content) return null;
-    const nodes = content.querySelectorAll<HTMLElement>("[data-block-id]");
+    const nodes = blockNodesRef.current.length
+      ? blockNodesRef.current
+      : Array.from(content.querySelectorAll<HTMLElement>("[data-block-id]"));
+    if (!nodes.length) return null;
     const viewport = scroller.getBoundingClientRect();
 
     if (paged) {
@@ -1005,7 +1020,7 @@ const PaginatedReader = ({
       const left = viewport.left + 4;
       const right = viewport.right - 4;
       let fallback: HTMLElement | null = null;
-      for (const node of Array.from(nodes)) {
+      for (const node of nodes) {
         fallback = fallback ?? node;
         const rects = node.getClientRects();
         const list = rects.length ? Array.from(rects) : [node.getBoundingClientRect()];
@@ -1018,30 +1033,32 @@ const PaginatedReader = ({
     }
 
     const top = viewport.top + 4;
-    let fallback: HTMLElement | null = null;
-    for (const node of Array.from(nodes)) {
-      const rect = node.getBoundingClientRect();
-      fallback = fallback ?? node;
-      if (rect.bottom >= top) return node;
-    }
-    return fallback;
+    const idx = findFirstVisibleBlockIndex(
+      nodes.length,
+      (i) => nodes[i].getBoundingClientRect(),
+      top,
+    );
+    return idx >= 0 ? nodes[idx] : nodes[0];
   }, [paged]);
 
-  const captureAnchor = useCallback(() => {
-    const scroller = scrollRef.current;
-    const node = visibleBlockElement();
-    if (!scroller || !node) return;
-    const id = node.dataset.blockId;
-    if (!id) return;
-    anchorRef.current = {
-      id,
-      // Paged mode anchors to the page that holds the block; there is no
-      // meaningful vertical offset to preserve across a re-columnisation.
-      offset: paged
-        ? 0
-        : node.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
-    };
-  }, [paged, visibleBlockElement]);
+  const captureAnchor = useCallback(
+    (precomputedNode?: HTMLElement | null) => {
+      const scroller = scrollRef.current;
+      const node = precomputedNode ?? visibleBlockElement();
+      if (!scroller || !node) return;
+      const id = node.dataset.blockId;
+      if (!id) return;
+      anchorRef.current = {
+        id,
+        // Paged mode anchors to the page that holds the block; there is no
+        // meaningful vertical offset to preserve across a re-columnisation.
+        offset: paged
+          ? 0
+          : node.getBoundingClientRect().top - scroller.getBoundingClientRect().top,
+      };
+    },
+    [paged, visibleBlockElement]
+  );
 
   const scrollToBlock = useCallback(
     (blockId: string, offset = 0) => {
@@ -1098,71 +1115,97 @@ const PaginatedReader = ({
 
   /* ------------------------- progress + location -------------------------- */
   const reportRef = useRef(0);
+  const lastPaginationRef = useRef<PaginationSnapshot | null>(null);
+  const lastReportedBlockIdRef = useRef<string | null>(null);
+  const scrollSettleTimerRef = useRef<number | null>(null);
 
-  const report = useCallback(() => {
-    const scroller = scrollRef.current;
-    if (!scroller) return;
+  const report = useCallback(
+    (options?: { capture?: boolean }) => {
+      const scroller = scrollRef.current;
+      if (!scroller) return;
 
-    let page: number;
-    let totalPages: number;
-    let percent: number;
+      let page: number;
+      let totalPages: number;
+      let percent: number;
 
-    if (paged) {
-      const engine = pagedRef.current;
-      totalPages = Math.max(1, engine?.totalPages() ?? 1);
-      page = Math.min(totalPages, Math.max(1, engine?.page() ?? 1));
-      percent = totalPages > 1 ? Math.round(((page - 1) / (totalPages - 1)) * 100) : 0;
-    } else {
-      const pageH = Math.max(scroller.clientHeight - 24, 1);
-      totalPages = Math.max(1, Math.ceil(scroller.scrollHeight / pageH));
-      page = Math.min(totalPages, Math.floor(scroller.scrollTop / pageH) + 1);
-      const maxScroll = Math.max(scroller.scrollHeight - scroller.clientHeight, 1);
-      percent = Math.min(100, Math.round((scroller.scrollTop / maxScroll) * 100));
-    }
+      if (paged) {
+        const engine = pagedRef.current;
+        totalPages = Math.max(1, engine?.totalPages() ?? 1);
+        page = Math.min(totalPages, Math.max(1, engine?.page() ?? 1));
+        percent = totalPages > 1 ? Math.round(((page - 1) / (totalPages - 1)) * 100) : 0;
+      } else {
+        const pageH = Math.max(scroller.clientHeight - 24, 1);
+        totalPages = Math.max(1, Math.ceil(scroller.scrollHeight / pageH));
+        page = Math.min(totalPages, Math.floor(scroller.scrollTop / pageH) + 1);
+        const maxScroll = Math.max(scroller.scrollHeight - scroller.clientHeight, 1);
+        percent = Math.min(100, Math.round((scroller.scrollTop / maxScroll) * 100));
+      }
 
+      const node = visibleBlockElement();
+      if (options?.capture && !restoringRef.current) {
+        captureAnchor(node);
+      }
+      const id = node?.dataset.blockId;
+      const index = id ? blockIndexById.get(id) ?? -1 : -1;
+      const block = index >= 0 ? blocks[index] : null;
 
-    const node = visibleBlockElement();
-    const id = node?.dataset.blockId;
-    const index = id ? blockIndexById.get(id) ?? -1 : -1;
-    const block = index >= 0 ? blocks[index] : null;
+      let chapterTitle = "";
+      for (const mark of chapterMarks) {
+        if (mark.index <= index) chapterTitle = mark.title;
+        else break;
+      }
 
-    let chapterTitle = "";
-    for (const mark of chapterMarks) {
-      if (mark.index <= index) chapterTitle = mark.title;
-      else break;
-    }
+      const nextPagination: PaginationSnapshot = { page, totalPages, percent, chapterTitle };
+      if (hasPaginationChanged(lastPaginationRef.current, nextPagination)) {
+        lastPaginationRef.current = nextPagination;
+        onPaginationChange?.(nextPagination);
+      }
 
-    onPaginationChange?.({ page, totalPages, percent, chapterTitle });
+      if (block && onLocationChange && lastReportedBlockIdRef.current !== block.id) {
+        lastReportedBlockIdRef.current = block.id;
+        onLocationChange({
+          blockIndex: originalIndexById.get(block.id) ?? index,
+          blockId: block.id,
+          page: block.page,
+          percent,
+          snippet: "text" in block ? block.text.slice(0, 60) : "",
+        });
+      }
+    },
+    [
+      blocks,
+      blockIndexById,
+      originalIndexById,
+      captureAnchor,
+      chapterMarks,
+      onLocationChange,
+      onPaginationChange,
+      paged,
+      visibleBlockElement,
+    ]
+  );
 
-    if (block && onLocationChange) {
-      onLocationChange({
-        blockIndex: originalIndexById.get(block.id) ?? index,
-        blockId: block.id,
-        page: block.page,
-        percent,
-        snippet: "text" in block ? block.text.slice(0, 60) : "",
-      });
-    }
-  }, [
-    blocks,
-    blockIndexById,
-    originalIndexById,
-    chapterMarks,
-    onLocationChange,
-    onPaginationChange,
-    paged,
-    visibleBlockElement,
-  ]);
-
+  const lastScrollReportMsRef = useRef(0);
 
   const handleScroll = useCallback(() => {
-    if (reportRef.current) return;
+    const now = performance.now();
+    // Throttle layout reads & parent state updates during active mobile flings;
+    // always run a trailing settle pass once scrolling stops.
+    if (scrollSettleTimerRef.current) {
+      window.clearTimeout(scrollSettleTimerRef.current);
+    }
+    scrollSettleTimerRef.current = window.setTimeout(() => {
+      scrollSettleTimerRef.current = null;
+      report({ capture: true });
+    }, 180);
+
+    if (now - lastScrollReportMsRef.current < 160 || reportRef.current) return;
     reportRef.current = requestAnimationFrame(() => {
       reportRef.current = 0;
-      if (!restoringRef.current) captureAnchor();
-      report();
+      lastScrollReportMsRef.current = performance.now();
+      report({ capture: true });
     });
-  }, [captureAnchor, report]);
+  }, [report]);
 
   useEffect(() => {
     const raf = requestAnimationFrame(() => {
@@ -1174,6 +1217,7 @@ const PaginatedReader = ({
 
   useEffect(() => () => {
     if (reportRef.current) cancelAnimationFrame(reportRef.current);
+    if (scrollSettleTimerRef.current) window.clearTimeout(scrollSettleTimerRef.current);
   }, []);
 
   /* ------------------------------- navigation ------------------------------ */
@@ -1721,6 +1765,8 @@ const PaginatedReader = ({
         fontFamily: READER_FONT_STACKS[settings.font],
         // Continuous vertical scrolling — never locked, never clipped.
         WebkitOverflowScrolling: "touch",
+        touchAction: "pan-y",
+        willChange: "scroll-position",
         overscrollBehavior: "contain",
         scrollbarWidth: "none",
         ["--reader-vh" as string]: `${Math.max(viewportHeight, 200)}px`,

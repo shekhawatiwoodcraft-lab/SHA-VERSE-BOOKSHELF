@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { useAudiobook } from "@/contexts/AudiobookContext";
 import { getLanguageMeta } from "@/lib/ai/languages";
+import { READER_AUDIO_TRANSLATION_HIDDEN } from "@/lib/ai/featureFlags";
 import { Button } from "@/components/ui/button";
 
 export default function MiniAudioPlayer() {
@@ -28,7 +29,7 @@ export default function MiniAudioPlayer() {
     setDrawerOpen,
   } = useAudiobook();
 
-  if (!session) return null;
+  if (READER_AUDIO_TRANSLATION_HIDDEN || !session) return null;
 
   const isInsideTargetReader = location.pathname === `/bookshelf/read/${session.bookId}`;
   // Inside active reader when drawer is open & unminimized, AudiobookPlayer handles display.

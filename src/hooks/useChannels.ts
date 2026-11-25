@@ -135,9 +135,17 @@ export const useUpdateChannel = () => {
       if (error) throw error;
       return data;
     },
-    onSuccess: () => {
+    onSuccess: (data, variables) => {
+      queryClient.setQueryData(['author-channel', variables.channelId], data);
+      queryClient.setQueryData(['channel-edit', variables.channelId], data);
+      queryClient.invalidateQueries({ queryKey: ['author-channel', variables.channelId] });
+      queryClient.invalidateQueries({ queryKey: ['channel-edit', variables.channelId] });
+      queryClient.invalidateQueries({ queryKey: ['my-author-channel'] });
       queryClient.invalidateQueries({ queryKey: ['my-channel'] });
       queryClient.invalidateQueries({ queryKey: ['channel'] });
+      queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['channel-analytics-raw', variables.channelId] });
+      queryClient.invalidateQueries({ queryKey: ['books'] });
       toast.success('Channel updated!');
     },
   });

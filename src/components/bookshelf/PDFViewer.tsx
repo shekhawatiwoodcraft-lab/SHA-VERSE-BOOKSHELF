@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 import { isDarkReaderTheme, type ReaderTheme } from "@/lib/reader/settings";
+import { computePdfCanvasMetrics } from "@/lib/reader/pdfLayout";
 
 export interface PDFOutlineItem {
   title: string;
@@ -251,14 +252,16 @@ const PDFViewer = ({
 
       // Calculate scale according to fitMode ("page" fits both width & height; "width" fits width)
       const originalViewport = page.getViewport({ scale: 1 });
-      const availableWidth = Math.max(effectiveContainerWidth - 24, 300);
       const containerEl = containerRef.current;
-      const availableHeight = containerEl ? Math.max(containerEl.clientHeight - 24, 240) : window.innerHeight - 120;
-      const scaleByWidth = availableWidth / originalViewport.width;
-      const scaleByHeight = availableHeight / originalViewport.height;
-      const fitScale = fitMode === "width" ? scaleByWidth : Math.min(scaleByWidth, scaleByHeight);
-      const responsiveScale = Math.max(0.1, fitScale) * scale;
-      const viewport = page.getViewport({ scale: responsiveScale });
+      const metrics = computePdfCanvasMetrics({
+        containerWidth: effectiveContainerWidth,
+        containerHeight: containerEl ? containerEl.clientHeight : window.innerHeight - 120,
+        pageWidth: originalViewport.width,
+        pageHeight: originalViewport.height,
+        fitMode,
+        scale,
+      });
+      const viewport = page.getViewport({ scale: metrics.responsiveScale });
 
       // Set canvas dimensions
       const pixelRatio = Math.min(window.devicePixelRatio || 1, 2.5);
@@ -301,6 +304,13 @@ const PDFViewer = ({
 
     return () => window.cancelAnimationFrame(frame);
   }, [renderPage, isLoading, retryCount]);
+
+  useEffect(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0;
+      containerRef.current.scrollLeft = 0;
+    }
+  }, [currentPage]);
 
   useEffect(() => {
     return () => {
@@ -366,13 +376,19 @@ const PDFViewer = ({
   const brightnessOverlayOpacity = Math.max(0, Math.min(0.5, 1 - brightness));
   const warmthOverlayOpacity = Math.max(0, Math.min(0.35, warmth));
 
+  const isZoomed = scale > 1.02;
+
   return (
     <div
       ref={containerRef}
       className={cn(
-        "flex flex-1 w-full h-full flex-col items-center overflow-auto select-none",
+        "flex w-full h-full overflow-auto overscroll-contain select-none",
         className
       )}
+      style={{
+        WebkitOverflowScrolling: "touch",
+        touchAction: isZoomed ? "pan-x pan-y pinch-zoom" : "pan-y pinch-zoom",
+      }}
       onTouchStart={(e) => {
         if (e.touches.length !== 1) return;
         const t = e.touches[0];
@@ -409,7 +425,7 @@ const PDFViewer = ({
         else onTap?.();
       }}
     >
-      <div className="relative my-auto">
+      <div className="relative m-auto shrink-0 p-1.5 sm:p-3">
         {isPageLoading && (
           <div className="absolute inset-0 flex items-center justify-center bg-background/50 backdrop-blur-sm z-10">
             <Loader2 className="w-6 h-6 animate-spin text-primary" />
@@ -419,7 +435,6 @@ const PDFViewer = ({
           ref={canvasRef}
           className="bg-background rounded-md block transition-[filter] duration-200"
           style={{
-            margin: "12px auto",
             filter: paperFilter,
             boxShadow: "0 8px 24px -4px rgba(0,0,0,0.18), 0 2px 8px -2px rgba(0,0,0,0.10)",
           }}

@@ -15,7 +15,7 @@
  * AdMob test device instead of flipping these flags.
  */
 
-export const USE_TEST_ADS = true;
+export const USE_TEST_ADS = false;
 
 /**
  * 🙈 GLOBAL ADS VISIBILITY SWITCH
@@ -58,9 +58,9 @@ const LIVE_AD_IDS = {
   rewardedMovion: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED
   rewardedNovachat: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED
   groupBoost: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED
-  videoPreRoll: "ca-app-pub-2928763177849470/1186858692", // legacy video slot (unused in Bookshelf)
-  videoMidRoll: "ca-app-pub-2928763177849470/4391156828", // legacy video slot (unused in Bookshelf)
-  shorts: "ca-app-pub-2928763177849470/4391156828", // legacy video slot (unused in Bookshelf)
+  videoPreRoll: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED (Bookshelf app)
+  videoMidRoll: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED (Bookshelf app)
+  shorts: "ca-app-pub-2928763177849470/2220787777", // reuse REWARDED (Bookshelf app)
   sponsoredStory: "ca-app-pub-2928763177849470/4855736154", // reuse NATIVE ADVANCED
   sponsoredGroup: "ca-app-pub-2928763177849470/4855736154", // reuse NATIVE ADVANCED
   sponsoredSuggestion: "ca-app-pub-2928763177849470/4855736154", // reuse NATIVE ADVANCED

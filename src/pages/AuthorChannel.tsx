@@ -232,9 +232,10 @@ const AuthorChannel = () => {
       </header>
 
       {/* Banner */}
-      <div className="h-32 sm:h-48 bg-gradient-primary relative">
+      <div className="h-32 sm:h-48 bg-gradient-primary relative overflow-hidden">
         {channel.banner_url && (
           <img
+            key={channel.banner_url}
             src={channel.banner_url}
             alt="Banner"
             className="w-full h-full object-cover"
@@ -246,7 +247,7 @@ const AuthorChannel = () => {
       <div className="max-w-6xl mx-auto px-4">
         <div className="flex flex-col sm:flex-row items-center sm:items-end gap-4 -mt-12 sm:-mt-8 mb-6">
           <Avatar className="w-24 h-24 sm:w-32 sm:h-32 border-4 border-background shadow-lg">
-            <AvatarImage src={channel.avatar_url || ""} />
+            <AvatarImage key={channel.avatar_url || "empty"} src={channel.avatar_url || ""} />
             <AvatarFallback className="text-3xl">{channel.name.charAt(0)}</AvatarFallback>
           </Avatar>
 
