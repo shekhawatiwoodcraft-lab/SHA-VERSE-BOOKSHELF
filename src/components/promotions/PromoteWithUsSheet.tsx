@@ -23,7 +23,6 @@ import {
   Clock,
   Headphones,
   RotateCcw,
-  HeartHandshake,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
@@ -31,7 +30,6 @@ import { APP_OWNER_EMAIL } from '@/hooks/useAppPromotions';
 import {
   buildPromotionPricing,
   buildOwnerGmailUrl,
-  type PricingRegion,
 } from '@/lib/promotions/promotePricing';
 
 interface PromoteWithUsSheetProps {
@@ -42,11 +40,10 @@ interface PromoteWithUsSheetProps {
 export default function PromoteWithUsSheet({ open, onOpenChange }: PromoteWithUsSheetProps) {
   const handleClose = useCallback(() => onOpenChange(false), [onOpenChange]);
   useRegisterBackOverlay(open, 'promote-with-us-sheet', handleClose);
-  const [region, setRegion] = useState<PricingRegion>('INTL');
   const [selectedHours, setSelectedHours] = useState<number | undefined>(undefined);
   const [copied, setCopied] = useState(false);
 
-  const pricingTiers = buildPromotionPricing(region);
+  const pricingTiers = buildPromotionPricing();
   const selectedTier = selectedHours
     ? pricingTiers.find((t) => t.hours === selectedHours)
     : undefined;
@@ -125,35 +122,6 @@ export default function PromoteWithUsSheet({ open, onOpenChange }: PromoteWithUs
             </div>
           </div>
 
-          {/* Highlighted Charity & Social Impact Message */}
-          <div
-            data-testid="promote-charity-highlight"
-            className="rounded-2xl border-2 border-emerald-300 dark:border-emerald-700/80 bg-gradient-to-br from-emerald-50 via-teal-50/80 to-amber-50/70 dark:from-emerald-950/50 dark:via-teal-950/40 dark:to-amber-950/25 p-4 shadow-sm"
-          >
-            <div className="flex items-start gap-3">
-              <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-sm">
-                <HeartHandshake className="w-5 h-5" />
-              </div>
-              <div className="space-y-1.5 min-w-0">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wide bg-emerald-600 text-white">
-                    60% Revenue Donated
-                  </span>
-                  <span className="text-[11px] font-semibold text-emerald-800 dark:text-emerald-300">
-                    Charity &amp; Humanitarian Pledge
-                  </span>
-                </div>
-                <p className="text-xs font-semibold leading-relaxed text-emerald-950 dark:text-emerald-50">
-                  At <span className="font-extrabold">Sha-Verse: Bookshelf</span>,{' '}
-                  <span className="underline decoration-emerald-500/70 decoration-2 underline-offset-2 font-extrabold">
-                    60% of all promotion revenue
-                  </span>{' '}
-                  is donated directly to support poor, oppressed, and helpless children and people in need.
-                </p>
-              </div>
-            </div>
-          </div>
-
           {/* HOW IT WORKS */}
           <div className="space-y-2.5">
             <h3 className="text-[11px] font-bold tracking-wider uppercase text-muted-foreground">
@@ -198,48 +166,18 @@ export default function PromoteWithUsSheet({ open, onOpenChange }: PromoteWithUs
 
           {/* PRICING */}
           <div className="space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-[11px] font-bold tracking-wider uppercase text-muted-foreground">
-                PRICING
-              </h3>
-              <div className="inline-flex rounded-lg border bg-muted/40 p-0.5 text-[11px] font-semibold">
-                <button
-                  type="button"
-                  onClick={() => setRegion('IN')}
-                  className={cn(
-                    'px-2.5 py-1 rounded-md transition-colors',
-                    region === 'IN'
-                      ? 'bg-[#1d63eb] text-white'
-                      : 'text-muted-foreground hover:text-foreground',
-                  )}
-                >
-                  IN India
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setRegion('INTL')}
-                  className={cn(
-                    'px-2.5 py-1 rounded-md transition-colors',
-                    region === 'INTL'
-                      ? 'bg-[#1d63eb] text-white'
-                      : 'text-muted-foreground hover:text-foreground',
-                  )}
-                >
-                  International
-                </button>
-              </div>
-            </div>
+            <h3 className="text-[11px] font-bold tracking-wider uppercase text-muted-foreground">
+              PRICING
+            </h3>
 
             <div className="rounded-2xl border bg-card overflow-hidden">
               <div className="px-4 py-3 border-b flex items-center justify-between gap-2">
                 <div>
                   <p className="text-sm font-bold text-foreground">
-                    {region === 'INTL' ? 'International (USD)' : 'India (INR)'}
+                    International (USD)
                   </p>
                   <p className="text-[11px] text-muted-foreground">
-                    {region === 'INTL'
-                      ? 'No tax + 50% launch discount applied'
-                      : '50% launch discount applied'}
+                    No tax + 50% launch discount applied
                   </p>
                 </div>
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-400 dark:border-emerald-900">
@@ -370,12 +308,6 @@ export default function PromoteWithUsSheet({ open, onOpenChange }: PromoteWithUs
               <div className="rounded-xl border bg-card p-3 flex items-center gap-2">
                 <Headphones className="w-4 h-4 text-[#1d63eb] shrink-0" />
                 <span className="text-xs font-medium text-foreground">24/7 Dedicated Support</span>
-              </div>
-              <div className="rounded-xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50/60 dark:bg-emerald-950/30 p-3 flex items-center gap-2">
-                <HeartHandshake className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                <span className="text-xs font-semibold text-emerald-900 dark:text-emerald-200">
-                  60% Donated to Charity
-                </span>
               </div>
             </div>
           </div>

@@ -1,6 +1,4 @@
-import { APP_OWNER_EMAIL } from '@/hooks/useAppPromotions';
-
-export type PricingRegion = 'IN' | 'INTL';
+import { APP_OWNER_EMAIL } from '@/modules/bookshelf/lib/uploadAccess';
 
 export interface PricingTier {
   hours: number;
@@ -10,31 +8,19 @@ export interface PricingTier {
   discountBadge: string;
 }
 
-export function buildPromotionPricing(region: PricingRegion): PricingTier[] {
+export function buildPromotionPricing(): PricingTier[] {
   const tiers: PricingTier[] = [];
   for (let hours = 1; hours <= 24; hours++) {
     const label = hours === 1 ? '1 hour' : `${hours} hours`;
-    if (region === 'INTL') {
-      const price = (hours * 2.99).toFixed(2);
-      const original = (hours * 5.99).toFixed(2);
-      tiers.push({
-        hours,
-        label,
-        priceFormatted: `$${price}`,
-        originalFormatted: `$${original}`,
-        discountBadge: '50% off',
-      });
-    } else {
-      const price = (hours * 149).toLocaleString('en-IN');
-      const original = (hours * 299).toLocaleString('en-IN');
-      tiers.push({
-        hours,
-        label,
-        priceFormatted: `₹${price}`,
-        originalFormatted: `₹${original}`,
-        discountBadge: '50% off',
-      });
-    }
+    const price = ((hours * 300 - 1) / 100).toFixed(2);
+    const original = ((hours * 600 - 1) / 100).toFixed(2);
+    tiers.push({
+      hours,
+      label,
+      priceFormatted: `$${price}`,
+      originalFormatted: `$${original}`,
+      discountBadge: '50% off',
+    });
   }
   return tiers;
 }

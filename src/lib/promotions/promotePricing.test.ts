@@ -2,28 +2,37 @@ import { describe, it, expect } from 'vitest';
 import { buildPromotionPricing, buildOwnerGmailUrl } from './promotePricing';
 
 describe('promotePricing helper', () => {
-  it('generates 24 hourly tiers for both International and India regions', () => {
-    const intl = buildPromotionPricing('INTL');
-    expect(intl).toHaveLength(24);
-    expect(intl[0]).toEqual({
+  it('generates exact 24 hourly International USD tiers for all users', () => {
+    const tiers = buildPromotionPricing();
+    expect(tiers).toHaveLength(24);
+    expect(tiers[0]).toEqual({
       hours: 1,
       label: '1 hour',
       priceFormatted: '$2.99',
       originalFormatted: '$5.99',
       discountBadge: '50% off',
     });
-    expect(intl[23]).toEqual({
-      hours: 24,
-      label: '24 hours',
-      priceFormatted: '$71.76',
-      originalFormatted: '$143.76',
+    expect(tiers[2]).toEqual({
+      hours: 3,
+      label: '3 hours',
+      priceFormatted: '$8.99',
+      originalFormatted: '$17.99',
       discountBadge: '50% off',
     });
-
-    const india = buildPromotionPricing('IN');
-    expect(india).toHaveLength(24);
-    expect(india[0].priceFormatted).toBe('₹149');
-    expect(india[0].originalFormatted).toBe('₹299');
+    expect(tiers[9]).toEqual({
+      hours: 10,
+      label: '10 hours',
+      priceFormatted: '$29.99',
+      originalFormatted: '$59.99',
+      discountBadge: '50% off',
+    });
+    expect(tiers[23]).toEqual({
+      hours: 24,
+      label: '24 hours',
+      priceFormatted: '$71.99',
+      originalFormatted: '$143.99',
+      discountBadge: '50% off',
+    });
   });
 
   it('builds a direct Gmail compose redirect URL addressed to shashaaiteam@gmail.com', () => {
@@ -33,9 +42,9 @@ describe('promotePricing helper', () => {
     expect(parsedDefault.searchParams.get('view')).toBe('cm');
     expect(parsedDefault.searchParams.get('to')).toBe('shashaaiteam@gmail.com');
 
-    const planUrl = buildOwnerGmailUrl({ hours: 3, priceFormatted: '$8.97' });
+    const planUrl = buildOwnerGmailUrl({ hours: 3, priceFormatted: '$8.99' });
     const parsedPlan = new URL(planUrl);
     expect(parsedPlan.searchParams.get('su')).toContain('3 hours');
-    expect(parsedPlan.searchParams.get('body')).toContain('$8.97');
+    expect(parsedPlan.searchParams.get('body')).toContain('$8.99');
   });
 });
